@@ -1,0 +1,21 @@
+[package]
+name = "streetlight-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+reed-solomon-simd.workspace = true
+ring.workspace = true
+thiserror.workspace = true
+spake2.workspace = true
+rand.workspace = true
+anyhow = { workspace = true, optional = true }
+quinn = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+
+[features]
+net = ["dep:anyhow", "dep:quinn", "dep:rustls", "dep:rcgen"]

@@ -1,0 +1,6 @@
+/target
+*.hevc
+*.h265
+*.mkv
+.DS_Store
+clients/ios/build/
