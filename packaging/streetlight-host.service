@@ -1,0 +1,15 @@
+# ~/.config/systemd/user/streetlight-host.service
+#   systemctl --user enable --now streetlight-host
+[Unit]
+Description=Streetlight game streaming host
+After=graphical-session.target pipewire.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.cargo/bin/streetlight-host serve
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=graphical-session.target
