@@ -23,7 +23,8 @@ ipad:  UDP → client-core (Rust, C ABI) → AVSampleBufferDisplayLayer + WKWebV
 | Linux client webview UI (`--features webview`) | working: discover → connect → apps → stream (1440p144 from the UI) |
 | Pi 5 V4L2-request decode path | written; untested on hardware |
 | iPad app | written; needs a Mac to build (untested) |
-| Input (kbd/mouse/touch/gamepad), audio | written; host side runs, not yet verified end to end |
+| Input: keyboard, mouse (abs + 1:1 relative), scroll, buttons, touch, gamepad | verified end to end (`--selftest --clicks` + `input_probe`) |
+| Audio: PipeWire → Opus 5 ms → client | verified (440 Hz test tone decoded at the expected level) |
 
 Not done yet: HDR (Main10/PQ), AV1 on iPad, adaptive bitrate, client-side cursor, relative-mouse
 pointer lock on Linux, and choosing the refresh rate of the virtual display (KWin's protocol only takes a size).
@@ -83,6 +84,17 @@ open Streetlight.xcodeproj   # set your signing team, run on the iPad
 * A hardware keyboard, a mouse (pointer locked while streaming) and MFi/Xbox/PlayStation
   controllers are passed through.
 * The defaults assume Wi-Fi: 20 % FEC and 600 Mbit/s packet pacing.
+
+## Self-test (input and audio)
+
+```bash
+SL_SELFTEST_GATE=/tmp/sl-gate streetlight-client 127.0.0.1 --selftest --clicks &
+sleep 3; SL_SELFTEST_GATE=/tmp/sl-gate cargo run -p streetlight-client --example input_probe -- streetlight
+```
+
+The probe window opens fullscreen on the streamed virtual display and logs every key, motion,
+button, scroll and touch event it receives. Keyboard and mouse events are only sent once the probe
+reports that it has focus on that display.
 
 ## Layout
 

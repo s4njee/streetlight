@@ -53,6 +53,7 @@ pub struct AppState {
     session: Mutex<Option<Session>>,
     session_owner: Mutex<u64>,
     pub status_tx: watch::Sender<u64>,
+    pub output_target: input::SharedTarget,
 }
 
 struct Session {
@@ -72,6 +73,7 @@ impl AppState {
             session: Mutex::new(None),
             session_owner: Mutex::new(0),
             status_tx: watch::channel(0).0,
+            output_target: Default::default(),
         })
     }
 
@@ -151,7 +153,7 @@ async fn handle(state: Arc<AppState>, conn: quinn::Connection, conn_id: u64) -> 
     loop {
         if paired && !aux_started {
             aux_started = true;
-            tokio::spawn(input_task(conn.clone()));
+            tokio::spawn(input_task(conn.clone(), state.output_target.clone()));
             tokio::spawn(feedback_task(conn.clone(), state.clone()));
         }
         let Some(msg) = net::recv_msg::<ClientMsg>(&mut rx).await? else { return Ok(()) };
@@ -267,9 +269,11 @@ fn start_session(state: &AppState, req: StreamRequest, owner: u64, client: Strin
     state.media.begin(SessionKeys { key, token, fec, pace_mbps: req.pace_mbps });
 
     let scale = if d.scale > 0.5 { d.scale as f64 } else { 1.0 };
+    let vname = format!("streetlight-{}", client.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>());
+    let kwin_output = if d.virtual_display { format!("Virtual-{vname}") } else { String::new() };
     let source = if d.virtual_display {
         Source::Virtual {
-            name: format!("streetlight-{}", client.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>()),
+            name: vname.clone(),
             width: (w as f64 / scale).round() as u32,
             height: (h as f64 / scale).round() as u32,
             scale,
@@ -321,6 +325,25 @@ fn start_session(state: &AppState, req: StreamRequest, owner: u64, client: Strin
         }
     }
 
+    // Absolute input needs the new output's place in the desktop layout; it appears asynchronously.
+    {
+        let target = state.output_target.clone();
+        let gen_ = { let mut t = target.lock().unwrap(); t.generation += 1; t.name = kwin_output.clone(); t.map = None; t.generation };
+        std::thread::spawn(move || {
+            if kwin_output.is_empty() {
+                return;
+            }
+            let map = crate::capture::layout::wait_for(&kwin_output, std::time::Duration::from_secs(3));
+            if map.is_none() {
+                tracing::warn!("output {kwin_output} not found in layout; absolute input unmapped");
+            }
+            let mut t = target.lock().unwrap();
+            if t.generation == gen_ {
+                t.map = map;
+                t.generation += 1;
+            }
+        });
+    }
     *state.session.lock().unwrap() = Some(Session { video, _audio: audio });
     *state.session_owner.lock().unwrap() = owner;
     *state.status.lock().unwrap() = Status {
@@ -349,8 +372,8 @@ fn start_session(state: &AppState, req: StreamRequest, owner: u64, client: Strin
     })
 }
 
-async fn input_task(conn: quinn::Connection) {
-    let injector = match input::Injector::new() {
+async fn input_task(conn: quinn::Connection, target: input::SharedTarget) {
+    let injector = match input::Injector::new(target) {
         Ok(i) => Arc::new(Mutex::new(i)),
         Err(e) => {
             tracing::error!("input disabled: {e:#}");

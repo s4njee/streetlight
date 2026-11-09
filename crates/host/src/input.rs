@@ -2,11 +2,25 @@
 //! exposes real gamepads to games / Steam Input).
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use evdev::uinput::VirtualDevice;
 use evdev::{AbsInfo, AbsoluteAxisCode, AttributeSet, BusType, EventType, InputEvent as Ev, InputId, KeyCode, RelativeAxisCode, UinputAbsSetup};
 use streetlight_proto::control::{GamepadState, InputEvent, MouseButton, TouchPhase, pad_buttons as pb};
+
+use crate::capture::layout::AbsMap;
+
+/// Which desktop output the current stream shows (set by the session).
+#[derive(Debug, Clone, Default)]
+pub struct OutputTarget {
+    /// KWin output name, e.g. "Virtual-streetlight-ipad".
+    pub name: String,
+    pub map: Option<AbsMap>,
+    pub generation: u64,
+}
+
+pub type SharedTarget = Arc<Mutex<OutputTarget>>;
 
 pub struct Injector {
     kbm: VirtualDevice,
@@ -14,6 +28,10 @@ pub struct Injector {
     touch: VirtualDevice,
     pads: HashMap<u8, (VirtualDevice, GamepadState)>,
     touch_slots: [bool; 10],
+    target: SharedTarget,
+    applied_generation: u64,
+    map: Option<AbsMap>,
+    last_abs: (u16, u16),
 }
 
 fn syn() -> Ev {
@@ -46,7 +64,7 @@ fn abs_axis(code: AbsoluteAxisCode, min: i32, max: i32, flat: i32) -> UinputAbsS
 }
 
 impl Injector {
-    pub fn new() -> Result<Self> {
+    pub fn new(target: SharedTarget) -> Result<Self> {
         let mut keys = AttributeSet::<KeyCode>::new();
         for c in 1..=248u16 {
             keys.insert(KeyCode::new(c));
@@ -101,14 +119,60 @@ impl Injector {
             .with_absolute_axis(&abs_axis(AbsoluteAxisCode::ABS_MT_POSITION_Y, 0, 65535, 0))?
             .build()?;
 
-        Ok(Self { kbm, abs: abs_dev, touch, pads: HashMap::new(), touch_slots: [false; 10] })
+        let mut kbm = kbm;
+        // Relative motion must reach games 1:1: turn off KWin pointer acceleration for our
+        // virtual mouse (the client side already applied the user's own acceleration).
+        if let Some(sys) = sysname(&mut kbm) {
+            std::thread::spawn(move || {
+                for _ in 0..20 {
+                    if kwin_set(&sys, "pointerAccelerationProfileFlat", "b", "true") {
+                        kwin_set(&sys, "pointerAcceleration", "d", "0");
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                tracing::warn!("couldn't disable pointer acceleration on {sys}");
+            });
+        }
+        Ok(Self { kbm, abs: abs_dev, touch, pads: HashMap::new(), touch_slots: [false; 10], target, applied_generation: u64::MAX, map: None, last_abs: (u16::MAX, u16::MAX) })
+    }
+
+    /// Pick up a new stream target: rescale absolute pointer coordinates into the whole
+    /// desktop (KWin maps absolute pointers across all outputs) and pin the touchscreen
+    /// to the streamed output.
+    fn sync_target(&mut self) {
+        let t = self.target.lock().unwrap().clone();
+        if t.generation == self.applied_generation {
+            return;
+        }
+        self.applied_generation = t.generation;
+        self.map = t.map;
+        tracing::info!("input mapped to output '{}' ({:?})", t.name, t.map);
+        if t.name.is_empty() {
+            return;
+        }
+        if let Some(sys) = sysname(&mut self.touch)
+            && !kwin_set(&sys, "outputName", "s", &t.name)
+        {
+            tracing::warn!("couldn't map touchscreen {sys} to {}", t.name);
+        }
     }
 
     pub fn inject(&mut self, ev: &InputEvent) -> Result<()> {
+        if matches!(ev, InputEvent::MouseAbs { .. } | InputEvent::Touch { .. }) {
+            self.sync_target();
+        }
         match *ev {
             InputEvent::Key { code, down } => self.kbm.emit(&[key(code, down as i32), syn()])?,
             InputEvent::MouseMove { dx, dy } => self.kbm.emit(&[rel(RelativeAxisCode::REL_X, dx), rel(RelativeAxisCode::REL_Y, dy), syn()])?,
             InputEvent::MouseAbs { x, y } => {
+                let (mut x, y) = self.map.map_or((x, y), |m| m.map(x, y));
+                // evdev drops an ABS value equal to the previous one, so a repeat (e.g. after
+                // relative motion moved the cursor away) would be ignored. Nudge by one unit.
+                if (x, y) == self.last_abs {
+                    x ^= 1;
+                }
+                self.last_abs = (x, y);
                 self.abs.emit(&[abs(AbsoluteAxisCode::ABS_X, x as i32), abs(AbsoluteAxisCode::ABS_Y, y as i32), syn()])?
             }
             InputEvent::MouseButton { button, down } => self.kbm.emit(&[key(button_code(button).0, down as i32), syn()])?,
@@ -251,4 +315,19 @@ fn new_pad(id: u8) -> Result<VirtualDevice> {
         .with_absolute_axis(&abs_axis(AbsoluteAxisCode::ABS_HAT0X, -1, 1, 0))?
         .with_absolute_axis(&abs_axis(AbsoluteAxisCode::ABS_HAT0Y, -1, 1, 0))?
         .build()?)
+}
+
+/// "eventN" for a uinput device we created.
+fn sysname(dev: &mut VirtualDevice) -> Option<String> {
+    let p = dev.enumerate_dev_nodes_blocking().ok()?.find_map(|p| p.ok())?;
+    p.file_name()?.to_str().map(String::from)
+}
+
+/// Set an org.kde.KWin.InputDevice property (KDE-only; harmless no-op elsewhere).
+fn kwin_set(sys: &str, prop: &str, sig: &str, value: &str) -> bool {
+    std::process::Command::new("busctl")
+        .args(["--user", "set-property", "org.kde.KWin", &format!("/org/kde/KWin/InputDevice/{sys}"), "org.kde.KWin.InputDevice", prop, sig, value])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }

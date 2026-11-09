@@ -9,6 +9,7 @@ mod audio;
 mod bridge;
 mod decode;
 mod session;
+mod selftest;
 mod settings;
 mod view;
 
@@ -46,6 +47,8 @@ struct Args {
     dump: Option<String>,
     seconds: u64,
     windowed: bool,
+    selftest: bool,
+    clicks: bool,
     no_input: bool,
     overrides: settings::Overrides,
 }
@@ -61,13 +64,18 @@ fn parse() -> Args {
             "--fps" => a.overrides.fps = it.next().and_then(|s| s.parse().ok()),
             "--bitrate" => a.overrides.bitrate_kbps = it.next().and_then(|s| s.parse().ok()),
             "--windowed" => a.windowed = true,
+            "--selftest" => a.selftest = true,
+            "--clicks" => a.clicks = true,
             "--no-input" => a.no_input = true,
             "-h" | "--help" => {
                 println!("usage: streetlight-client [host] [--size WxH] [--fps N] [--bitrate kbps] [--dump file --seconds N]");
                 std::process::exit(0);
             }
             h if !h.starts_with('-') => a.host = Some(h.to_string()),
-            _ => {}
+            other => {
+                eprintln!("unknown option {other} (see --help)");
+                std::process::exit(2);
+            }
         }
     }
     a
@@ -142,6 +150,9 @@ fn main() -> Result<()> {
     let args = parse();
     if args.dump.is_some() {
         return dump(args);
+    }
+    if args.selftest {
+        return selftest::run(connect_cli(&resolve_host(args.host.clone())?)?, args.clicks);
     }
     let app = gtk4::Application::builder().application_id("dev.streetlight.Client").flags(gio::ApplicationFlags::NON_UNIQUE).build();
     let args = Rc::new(RefCell::new(Some(args)));
