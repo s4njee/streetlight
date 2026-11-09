@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Streetlight</title>
+<style>
+  :root {
+    --bg: #0d0f14; --panel: #161a22; --panel-2: #1d222c; --line: #2a303c;
+    --text: #e8ebf1; --muted: #8b93a3; --accent: #ffb547; --accent-ink: #1a1306;
+    --ok: #4cd08a; --bad: #ff6b6b; --radius: 14px;
+    --focus: 0 0 0 3px #0d0f14, 0 0 0 6px var(--accent);
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: transparent; color: var(--text);
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Inter, sans-serif; -webkit-user-select: none; user-select: none; }
+  body.ui { background: radial-gradient(1200px 600px at 80% -10%, #2a2312 0%, transparent 60%), var(--bg); }
+  body.streaming { background: transparent; }
+  body.streaming #app { display: none; }
+  #app { max-width: 1180px; margin: 0 auto; padding: max(28px, env(safe-area-inset-top)) max(24px, env(safe-area-inset-right)) 40px max(24px, env(safe-area-inset-left)); }
+  header { display: flex; align-items: center; gap: 14px; margin-bottom: 28px; }
+  .logo { width: 34px; height: 34px; border-radius: 9px; background: linear-gradient(160deg, var(--accent), #ff7a29);
+    display: grid; place-items: center; box-shadow: 0 6px 24px #ff9b2f40; }
+  .logo::after { content: ""; width: 10px; height: 10px; border-radius: 50%; background: #fff7e6; box-shadow: 0 0 14px #fff; }
+  h1 { font-size: 22px; margin: 0; letter-spacing: .2px; }
+  .crumb { color: var(--muted); font-size: 15px; }
+  .spacer { flex: 1; }
+  h2 { font-size: 15px; text-transform: uppercase; letter-spacing: 1.2px; color: var(--muted); margin: 26px 0 12px; font-weight: 600; }
+  button, input, select { font: inherit; color: inherit; }
+  button { cursor: pointer; border: 0; }
+  :focus { outline: none; }
+  :focus-visible, .card:focus { box-shadow: var(--focus); }
+  .btn { background: var(--panel-2); border: 1px solid var(--line); padding: 10px 16px; border-radius: 10px; }
+  .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 650; }
+  .btn:hover { filter: brightness(1.12); }
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; text-align: left;
+    display: flex; flex-direction: column; gap: 6px; min-height: 108px; transition: transform .12s ease, background .12s ease; }
+  .card:hover, .card:focus { background: var(--panel-2); transform: translateY(-2px); }
+  .card .title { font-size: 18px; font-weight: 600; }
+  .card .sub { color: var(--muted); font-size: 14px; font-variant-numeric: tabular-nums; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
+  .dot.on { background: var(--ok); box-shadow: 0 0 10px var(--ok); }
+  .app-tile { min-height: 150px; justify-content: flex-end; background:
+    linear-gradient(180deg, transparent 30%, #0008), var(--tile, linear-gradient(135deg, #2c3442, #1a1f29)); }
+  .app-tile .title { font-size: 20px; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  input[type=text], select { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-width: 0; }
+  input[type=text] { flex: 1; min-width: 200px; }
+  .pin { font: 700 72px/1 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: 18px; color: var(--accent);
+    background: var(--panel); border: 1px solid var(--line); border-radius: 20px; padding: 28px 22px 28px 40px; display: inline-block; margin: 18px 0; }
+  .center { text-align: center; padding-top: 6vh; }
+  .muted { color: var(--muted); }
+  .settings { display: grid; grid-template-columns: minmax(160px, 240px) 1fr; gap: 14px 18px; align-items: center; max-width: 720px; }
+  .settings label { color: var(--muted); }
+  .toast { position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%); background: var(--panel-2); border: 1px solid var(--line);
+    padding: 12px 18px; border-radius: 12px; opacity: 0; transition: opacity .2s; pointer-events: none; max-width: 90vw; }
+  .toast.show { opacity: 1; }
+  .toast.bad { border-color: var(--bad); }
+  .spinner { width: 22px; height: 22px; border-radius: 50%; border: 3px solid var(--line); border-top-color: var(--accent); animation: spin .8s linear infinite; display: inline-block; vertical-align: middle; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .hint { color: var(--muted); font-size: 14px; margin-top: 30px; }
+  kbd { background: var(--panel-2); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 6px; padding: 1px 6px; font-size: 13px; }
+  @media (max-width: 560px) { .settings { grid-template-columns: 1fr; } .pin { font-size: 52px; letter-spacing: 12px; } }
+</style>
+</head>
+<body class="ui">
+<div id="app"></div>
+<div id="toast" class="toast"></div>
+
+<script>
+/* ---- Native bridge (identical on WebKitGTK and WKWebView) ---------------------------- */
+window.streetlight = (() => {
+  let seq = 0;
+  const pending = new Map(), listeners = {};
+  const native = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.streetlight;
+  return {
+    available: !!native,
+    call(cmd, args = {}) {
+      return new Promise((resolve, reject) => {
+        if (!native) return reject(new Error("native bridge unavailable"));
+        const id = ++seq;
+        pending.set(id, { resolve, reject });
+        native.postMessage(JSON.stringify({ id, cmd, args }));
+      });
+    },
+    on(name, fn) { (listeners[name] ||= []).push(fn); },
+    __resolve(id, ok, value) {
+      const p = pending.get(id); if (!p) return;
+      pending.delete(id);
+      ok ? p.resolve(value) : p.reject(new Error(value));
+    },
+    __event(name, data) { (listeners[name] || []).forEach(f => f(data)); },
+  };
+})();
+const sl = window.streetlight;
+
+/* ---- tiny view helpers ------------------------------------------------------------------ */
+const $app = document.getElementById("app");
+const h = (tag, attrs = {}, ...kids) => {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else if (k === "class") el.className = v;
+    else if (v !== false && v != null) el.setAttribute(k, v === true ? "" : v);
+  }
+  for (const k of kids.flat()) if (k != null) el.append(k.nodeType ? k : document.createTextNode(k));
+  return el;
+};
+let toastTimer;
+function toast(msg, bad = false) {
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.className = "toast show" + (bad ? " bad" : "");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.className = "toast", 3500);
+}
+function screen(title, crumb, ...body) {
+  $app.replaceChildren(
+    h("header", {}, h("div", { class: "logo" }), h("h1", {}, title), crumb ? h("span", { class: "crumb" }, crumb) : null,
+      h("div", { class: "spacer" }),
+      h("button", { class: "btn", onclick: showSettings }, "Settings")),
+    ...body);
+  const first = $app.querySelector("[data-autofocus], .card, input, .btn.primary");
+  first && first.focus();
+}
+
+/* Arrow-key / D-pad focus movement across focusable elements, by geometry. */
+document.addEventListener("keydown", e => {
+  const dirs = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+  if (!dirs[e.key] || document.body.classList.contains("streaming")) return;
+  if (e.target.tagName === "INPUT" && (e.key === "ArrowLeft" || e.key === "ArrowRight")) return;
+  if (e.target.tagName === "SELECT") return;
+  const [dx, dy] = dirs[e.key];
+  const items = [...document.querySelectorAll("button, input, select")].filter(x => x.offsetParent);
+  const cur = document.activeElement, r0 = cur.getBoundingClientRect();
+  const c0 = [r0.left + r0.width / 2, r0.top + r0.height / 2];
+  let best = null, bestScore = Infinity;
+  for (const el of items) {
+    if (el === cur) continue;
+    const r = el.getBoundingClientRect(), c = [r.left + r.width / 2, r.top + r.height / 2];
+    const vx = c[0] - c0[0], vy = c[1] - c0[1];
+    const along = vx * dx + vy * dy; if (along <= 1) continue;
+    const across = Math.abs(vx * dy) + Math.abs(vy * dx);
+    const score = along + across * 2;
+    if (score < bestScore) { bestScore = score; best = el; }
+  }
+  if (best) { best.focus(); e.preventDefault(); }
+});
+if (window.matchMedia) document.addEventListener("keydown", e => { if (e.key === "Escape" && current.back) current.back(); });
+
+/* ---- screens ---------------------------------------------------------------------------- */
+let current = {}, connected = null;
+
+async function showHosts() {
+  current = {};
+  const manual = h("input", { type: "text", placeholder: "Host address (e.g. 192.168.1.20)", enterkeyhint: "go",
+    onkeydown: e => { if (e.key === "Enter" && manual.value.trim()) connect(manual.value.trim()); } });
+  const list = h("div", { class: "grid" }, h("div", { class: "muted" }, h("span", { class: "spinner" }), "  Looking for hosts…"));
+  screen("Streetlight", "Hosts",
+    h("h2", {}, "On this network"), list,
+    h("h2", {}, "Add manually"),
+    h("div", { class: "row" }, manual, h("button", { class: "btn primary", onclick: () => manual.value.trim() && connect(manual.value.trim()) }, "Connect")),
+    h("p", { class: "hint" }, "While streaming, press ", h("kbd", {}, "Ctrl"), " ", h("kbd", {}, "Alt"), " ", h("kbd", {}, "Shift"), " ", h("kbd", {}, "Q"), " to return here."));
+  try {
+    const [found, known] = await Promise.all([sl.call("discover"), sl.call("knownHosts")]);
+    const byAddr = new Map();
+    for (const k of known) byAddr.set(k.last_addr, { name: k.name, addr: k.last_addr, paired: true, online: false });
+    for (const f of found) {
+      const k = [...byAddr.values()].find(x => x.name === f.name);
+      if (k) { byAddr.delete(k.addr); byAddr.set(f.addr, { ...k, addr: f.addr, online: true }); }
+      else byAddr.set(f.addr, { name: f.name, addr: f.addr, paired: false, online: true });
+    }
+    const hosts = [...byAddr.values()];
+    list.replaceChildren(...(hosts.length ? hosts.map(hst =>
+      h("button", { class: "card", onclick: () => connect(hst.addr) },
+        h("span", { class: "title" }, hst.name),
+        h("span", { class: "sub" }, h("span", { class: "dot" + (hst.online ? " on" : "") }), hst.online ? "Online" : "Last seen", " · ", hst.addr),
+        h("span", { class: "sub" }, hst.paired ? "Paired" : "Not paired")))
+      : [h("div", { class: "muted" }, "No hosts found. Make sure streetlight-host is running, or enter its address below.")]));
+    list.querySelector(".card")?.focus();
+  } catch (e) { list.replaceChildren(h("div", { class: "muted" }, String(e.message || e))); }
+}
+
+async function connect(addr) {
+  screen("Connecting", addr, h("div", { class: "center" }, h("span", { class: "spinner" }), h("p", { class: "muted" }, `Connecting to ${addr}…`)));
+  try {
+    const w = await sl.call("connect", { host: addr });
+    connected = { addr, ...w };
+    if (!w.paired) return pair();
+    showApps();
+  } catch (e) { toast(e.message, true); showHosts(); }
+}
+
+async function pair() {
+  current = { back: () => { sl.call("disconnect"); showHosts(); } };
+  const pinEl = h("div", { class: "pin" }, "····");
+  screen("Pair with " + connected.host_name, connected.addr,
+    h("div", { class: "center" },
+      h("p", {}, "On the host PC, open ", h("b", {}, "http://127.0.0.1:47990"), " and enter this PIN:"),
+      pinEl,
+      h("p", { class: "muted" }, "or run ", h("kbd", {}, "streetlight-host pair <PIN>")),
+      h("p", { class: "muted" }, h("span", { class: "spinner" }), "  Waiting for the host…"),
+      h("button", { class: "btn", "data-autofocus": true, onclick: current.back }, "Cancel")));
+  const off = pin => pinEl.textContent = pin;
+  sl.on("pairPin", d => off(d.pin));
+  try {
+    const r = await sl.call("pair");
+    if (r.ok) { toast("Paired with " + connected.host_name); showApps(); }
+    else { toast("Pairing failed — wrong PIN?", true); showHosts(); }
+  } catch (e) { toast(e.message, true); showHosts(); }
+}
+
+const tileColors = ["#3a2a5e,#1b1530", "#173d3a,#0d1f1e", "#4a2a17,#24140b", "#1d3355,#0e1a2c", "#4b1d33,#260e1a"];
+async function showApps() {
+  current = { back: () => { sl.call("disconnect"); showHosts(); } };
+  const grid = h("div", { class: "grid" }, h("span", { class: "spinner" }));
+  screen(connected.host_name, "Apps", grid,
+    h("div", { class: "row", style: "margin-top:26px" }, h("button", { class: "btn", onclick: current.back }, "Disconnect")));
+  try {
+    const apps = await sl.call("apps");
+    grid.replaceChildren(...apps.map((a, i) => {
+      const [c1, c2] = tileColors[i % tileColors.length].split(",");
+      return h("button", { class: "card app-tile", style: `--tile: linear-gradient(135deg, ${c1}, ${c2})`, onclick: () => start(a) },
+        h("span", { class: "title" }, a.name), h("span", { class: "sub" }, "Launch"));
+    }));
+    grid.querySelector(".card")?.focus();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function start(app) {
+  try {
+    const info = await sl.call("start", { app: app.id });
+    document.body.className = "streaming";
+    toast(`${app.name}: ${info.width}×${info.height} @ ${info.fps} fps`);
+  } catch (e) { toast(e.message, true); }
+}
+sl.on("streamEnded", d => {
+  document.body.className = "ui";
+  if (d && d.reason) toast("Stream ended: " + d.reason);
+  connected ? showApps() : showHosts();
+});
+
+async function showSettings() {
+  const back = connected ? showApps : showHosts;
+  current = { back };
+  let s;
+  try { s = await sl.call("getSettings"); } catch (e) { return toast(e.message, true); }
+  const sel = (key, opts) => h("select", { id: key, onchange: e => s[key] = isNaN(+e.target.value) || e.target.value === "" ? e.target.value : +e.target.value },
+    ...opts.map(([v, label]) => { const o = h("option", { value: v }, label); if (String(s[key]) === String(v)) o.selected = true; return o; }));
+  screen("Settings", "Streaming",
+    h("div", { class: "settings" },
+      h("label", { for: "resolution" }, "Resolution"),
+      sel("resolution", [["native", "Match this display"], ["1280x720", "1280 × 720"], ["1920x1080", "1920 × 1080"], ["2560x1440", "2560 × 1440"], ["3840x2160", "3840 × 2160"], ["2732x2048", "2732 × 2048 (iPad Pro 12.9″)"], ["2388x1668", "2388 × 1668 (iPad Pro 11″)"]]),
+      h("label", { for: "fps" }, "Frame rate"),
+      sel("fps", [[0, "Match this display"], [30, "30"], [60, "60"], [90, "90"], [120, "120"], [144, "144"]]),
+      h("label", { for: "bitrate_kbps" }, "Bitrate"),
+      sel("bitrate_kbps", [[20000, "20 Mbit/s"], [40000, "40 Mbit/s"], [80000, "80 Mbit/s"], [120000, "120 Mbit/s"], [150000, "150 Mbit/s"], [200000, "200 Mbit/s"], [300000, "300 Mbit/s"]]),
+      h("label", { for: "codec" }, "Codec"),
+      sel("codec", [["Hevc", "HEVC (recommended; Pi 5 hardware)"], ["Av1", "AV1"], ["H264", "H.264"]]),
+      h("label", { for: "fec_percent" }, "Error correction"),
+      sel("fec_percent", [[0, "Off (wired only)"], [10, "10 %"], [20, "20 %"], [35, "35 % (Wi-Fi)"], [50, "50 %"]]),
+      h("label", { for: "pace_mbps" }, "Packet pacing"),
+      sel("pace_mbps", [[0, "Off (wired)"], [300, "300 Mbit/s (Wi-Fi 5)"], [600, "600 Mbit/s (Wi-Fi 6)"], [900, "900 Mbit/s"]]),
+      ...("touch_mode" in s ? [h("label", { for: "touch_mode" }, "Touch input"),
+        sel("touch_mode", [["pointer", "Pointer (tap to click, 2 fingers scroll)"], ["touchscreen", "Touchscreen passthrough"]])] : []),
+    ),
+    h("div", { class: "row", style: "margin-top:28px" },
+      h("button", { class: "btn primary", onclick: async () => { await sl.call("setSettings", s); toast("Saved"); back(); } }, "Save"),
+      h("button", { class: "btn", onclick: back }, "Cancel")));
+}
+
+/* ---- boot ------------------------------------------------------------------------------- */
+if (!sl.available) {
+  screen("Streetlight", "Preview", h("p", { class: "muted" }, "This page runs inside the Streetlight client app."));
+} else {
+  showHosts();
+}
+</script>
+</body>
+</html>

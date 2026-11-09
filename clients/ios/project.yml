@@ -1,0 +1,51 @@
+# XcodeGen spec:  brew install xcodegen && ./build-rust.sh && xcodegen && open Streetlight.xcodeproj
+name: Streetlight
+options:
+  bundleIdPrefix: dev.streetlight
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  Streetlight:
+    type: application
+    platform: iOS
+    sources:
+      - path: Streetlight
+      - path: ../../web/client/index.html
+        buildPhase: resources
+    dependencies:
+      - framework: StreetlightCore.xcframework
+        embed: false
+      - sdk: VideoToolbox.framework
+      - sdk: AVFoundation.framework
+      - sdk: GameController.framework
+      - sdk: Network.framework
+      - sdk: WebKit.framework
+      - sdk: libresolv.tbd
+    settings:
+      base:
+        TARGETED_DEVICE_FAMILY: "2"
+        SWIFT_VERSION: "5.10"
+        PRODUCT_BUNDLE_IDENTIFIER: dev.streetlight.client
+        INFOPLIST_FILE: Streetlight/Info.plist
+        OTHER_LDFLAGS: ["-lc++"]
+        CODE_SIGN_STYLE: Automatic
+    info:
+      path: Streetlight/Info.plist
+      properties:
+        CFBundleDisplayName: Streetlight
+        UILaunchScreen: {}
+        UIRequiresFullScreen: true
+        UIStatusBarHidden: true
+        UIViewControllerBasedStatusBarAppearance: false
+        UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        NSLocalNetworkUsageDescription: Streetlight streams games and your desktop from a PC on your local network.
+        NSBonjourServices: [_streetlight._udp]
+        GCSupportsControllerUserInteraction: true
+        GCSupportedGameControllers:
+          - ProfileName: ExtendedGamepad
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+          UISceneConfigurations:
+            UIWindowSceneSessionRoleApplication:
+              - UISceneConfigurationName: Default
+                UISceneDelegateClassName: $(PRODUCT_MODULE_NAME).SceneDelegate

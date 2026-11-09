@@ -1,0 +1,4 @@
+module StreetlightCore {
+    header "StreetlightCore.h"
+    export *
+}

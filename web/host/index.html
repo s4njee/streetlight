@@ -1,1 +1,205 @@
-<!doctype html><title>Streetlight</title>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Streetlight Host</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --line: #e4e1da; --text: #1d1b17; --muted: #6f6a60;
+    --accent: #e8890c; --accent-ink: #fff; --ok: #1f9d55; --bad: #d64545; --chip: #f1eee8;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1115; --panel: #171a21; --line: #272c36; --text: #e8ebf1; --muted: #8b93a3;
+      --accent: #ffb547; --accent-ink: #1a1306; --ok: #4cd08a; --bad: #ff6b6b; --chip: #1f242d; color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 920px; margin: 0 auto; padding: 32px 16px 64px; }
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 24px; }
+  .logo { width: 30px; height: 30px; border-radius: 8px; background: linear-gradient(160deg, #ffb547, #ff7a29); display: grid; place-items: center; }
+  .logo::after { content: ""; width: 9px; height: 9px; border-radius: 50%; background: #fff7e6; }
+  h1 { font-size: 20px; margin: 0; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin: 0 0 12px; }
+  .muted { color: var(--muted); }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 20px; margin-bottom: 16px; }
+  .pair { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent); }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .stat { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+  .stat div { background: var(--chip); border-radius: 10px; padding: 10px 12px; }
+  .stat b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+  .stat span { color: var(--muted); font-size: 13px; }
+  input, select, button, textarea { font: inherit; color: inherit; }
+  input, select { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; min-width: 0; }
+  .pin { font: 700 32px ui-monospace, Menlo, monospace; letter-spacing: 12px; width: 7.5em; text-align: center; }
+  button { border: 1px solid var(--line); background: var(--chip); border-radius: 8px; padding: 8px 14px; cursor: pointer; }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 600; }
+  button.danger { color: var(--bad); }
+  table { width: 100%; border-collapse: collapse; }
+  td, th { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  th { color: var(--muted); font-weight: 500; font-size: 13px; }
+  code { font-size: 12px; color: var(--muted); word-break: break-all; }
+  .grid2 { display: grid; grid-template-columns: 200px 1fr; gap: 10px 14px; align-items: center; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
+  .dot.on { background: var(--ok); }
+  @media (max-width: 600px) { .grid2 { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <header><div class="logo"></div><h1 id="title">Streetlight Host</h1><span class="muted" id="ver"></span></header>
+
+  <section id="pairbox" class="pair" hidden>
+    <h2>Pairing request</h2>
+    <p><b id="pairname"></b> wants to pair. Enter the PIN shown on that device.</p>
+    <form class="row" id="pairform">
+      <input id="pin" class="pin" inputmode="numeric" maxlength="4" autocomplete="off" placeholder="0000" aria-label="PIN">
+      <button class="primary">Pair</button>
+      <span id="pairmsg" class="muted"></span>
+    </form>
+  </section>
+
+  <section>
+    <h2>Status</h2>
+    <p id="state"><span class="dot"></span>Idle — waiting for a client.</p>
+    <div class="stat" id="stats" hidden></div>
+  </section>
+
+  <section>
+    <h2>Paired devices</h2>
+    <table><thead><tr><th>Name</th><th>Paired</th><th>Fingerprint</th><th></th></tr></thead><tbody id="clients"></tbody></table>
+    <p class="muted" id="noclients" hidden>No devices paired yet. Open Streetlight on your Pi or iPad to start.</p>
+  </section>
+
+  <section>
+    <h2>Settings</h2>
+    <form class="grid2" id="settings">
+      <label for="host_name">Host name</label><input id="host_name">
+      <label for="render_node">GPU render node</label><input id="render_node">
+      <label for="max_bitrate_kbps">Max bitrate (kbps)</label><input id="max_bitrate_kbps" type="number" min="1000" step="1000">
+      <label for="rc_mode">Rate control</label>
+      <select id="rc_mode"><option>VBR</option><option>CBR</option><option>QVBR</option></select>
+      <label for="embed_cursor">Draw cursor in video</label><input id="embed_cursor" type="checkbox" style="justify-self:start">
+      <span></span><div class="row"><button class="primary">Save</button><span id="savemsg" class="muted"></span></div>
+    </form>
+  </section>
+
+  <section>
+    <h2>Apps</h2>
+    <table><thead><tr><th>Name</th><th>Command</th><th></th></tr></thead><tbody id="apps"></tbody></table>
+    <div class="row" style="margin-top:12px">
+      <input id="newname" placeholder="Name"><input id="newcmd" placeholder="Command (optional)" style="flex:1">
+      <button id="addapp">Add</button>
+    </div>
+  </section>
+
+  <p class="muted">Host fingerprint: <code id="fp"></code></p>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let settings = null;
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { headers: { "content-type": "application/json" }, ...opts });
+  if (!r.ok) throw new Error(r.statusText);
+  return r.status === 204 ? null : r.json();
+}
+
+function text(el, s) { el.textContent = s; return el; }
+function td(content) { const c = document.createElement("td"); content instanceof Node ? c.append(content) : (c.textContent = content); return c; }
+
+async function refresh() {
+  let s;
+  try { s = await api("/api/status"); } catch { return; }
+  text($("title"), s.host_name); text($("ver"), "v" + s.version); text($("fp"), s.host_fingerprint);
+
+  const pending = s.pending;
+  if (pending && $("pairbox").hidden) { $("pin").value = ""; setTimeout(() => $("pin").focus(), 0); }
+  $("pairbox").hidden = !pending;
+  if (pending) text($("pairname"), pending.client_name);
+
+  const st = s.status;
+  $("state").innerHTML = "";
+  const dot = document.createElement("span"); dot.className = "dot" + (st.streaming ? " on" : "");
+  $("state").append(dot, st.streaming ? `Streaming to ${st.client}` : "Idle — waiting for a client.");
+  $("stats").hidden = !st.streaming;
+  if (st.streaming) {
+    const fb = st.last_feedback || {};
+    const cells = [
+      [`${st.width}×${st.height}`, "resolution"], [`${st.fps} fps`, "frame rate"], [st.codec, "codec"],
+      [`${(st.bitrate_kbps / 1000).toFixed(0)} Mbit/s`, "bitrate"],
+      [fb.decode_us_avg != null ? (fb.decode_us_avg / 1000).toFixed(2) + " ms" : "–", "client decode"],
+      [fb.frames_lost != null ? `${fb.frames_lost} / ${fb.frames_recovered}` : "–", "lost / FEC-recovered"],
+    ];
+    $("stats").replaceChildren(...cells.map(([v, l]) => { const d = document.createElement("div"); d.append(text(document.createElement("b"), v), text(document.createElement("span"), l)); return d; }));
+  }
+
+  $("noclients").hidden = s.clients.length > 0;
+  $("clients").replaceChildren(...s.clients.map(c => {
+    const tr = document.createElement("tr");
+    const b = document.createElement("button"); b.className = "danger"; b.textContent = "Unpair";
+    b.onclick = async () => { if (confirm(`Unpair ${c.name}?`)) { await api("/api/clients/" + c.fingerprint, { method: "DELETE" }); refresh(); } };
+    const code = document.createElement("code"); code.textContent = c.fingerprint.slice(0, 16) + "…";
+    tr.append(td(c.name), td(new Date(c.paired_at * 1000).toLocaleDateString()), td(code), td(b));
+    return tr;
+  }));
+}
+
+$("pairform").onsubmit = async e => {
+  e.preventDefault();
+  const r = await api("/api/pair", { method: "POST", body: JSON.stringify({ pin: $("pin").value }) });
+  text($("pairmsg"), r.ok ? "Sent — check the device." : "No pairing request waiting.");
+  setTimeout(refresh, 600);
+};
+
+function renderApps() {
+  $("apps").replaceChildren(...settings.apps.map((a, i) => {
+    const tr = document.createElement("tr");
+    const b = document.createElement("button"); b.className = "danger"; b.textContent = "Remove";
+    b.onclick = () => { settings.apps.splice(i, 1); saveSettings(); };
+    tr.append(td(a.name), td(a.command || "—"), td(b));
+    return tr;
+  }));
+}
+
+async function loadSettings() {
+  settings = await api("/api/settings");
+  for (const k of ["host_name", "render_node", "max_bitrate_kbps", "rc_mode"]) $(k).value = settings[k];
+  $("embed_cursor").checked = settings.embed_cursor;
+  renderApps();
+}
+
+async function saveSettings() {
+  await api("/api/settings", { method: "PUT", body: JSON.stringify(settings) });
+  text($("savemsg"), "Saved.");
+  renderApps();
+}
+
+$("settings").onsubmit = e => {
+  e.preventDefault();
+  settings.host_name = $("host_name").value;
+  settings.render_node = $("render_node").value;
+  settings.max_bitrate_kbps = +$("max_bitrate_kbps").value;
+  settings.rc_mode = $("rc_mode").value;
+  settings.embed_cursor = $("embed_cursor").checked;
+  saveSettings();
+};
+
+$("addapp").onclick = () => {
+  const name = $("newname").value.trim();
+  if (!name) return;
+  const id = name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+  settings.apps.push({ id, name, command: $("newcmd").value.trim() || null });
+  $("newname").value = $("newcmd").value = "";
+  saveSettings();
+};
+
+loadSettings();
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
