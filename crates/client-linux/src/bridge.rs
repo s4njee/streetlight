@@ -49,6 +49,14 @@ pub fn install(window: &gtk4::ApplicationWindow, view: Rc<StreamView>) {
             Err(e) => tracing::warn!("bad bridge message: {e}"),
         }
     });
+    // Dev hook: run a script once the UI has loaded (used for automated UI tests).
+    if let Ok(script) = std::env::var("SL_UI_EVAL") {
+        webview.connect_load_changed(move |wv, ev| {
+            if ev == webkit6::LoadEvent::Finished {
+                wv.evaluate_javascript(&script, None, None, None::<&gtk4::gio::Cancellable>, |_| {});
+            }
+        });
+    }
     webview.load_html(INDEX_HTML, Some("streetlight://app/"));
     view.root.add_overlay(&webview);
 

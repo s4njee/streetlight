@@ -20,7 +20,7 @@ ipad:  UDP → client-core (Rust, C ABI) → AVSampleBufferDisplayLayer + WKWebV
 | Wire protocol: FEC, encryption, GSO send, pairing | working, unit-tested |
 | End to end over loopback | 1440p60 @ 80 Mbit/s, 0 loss, ~2–6 ms capture→received |
 | Linux client: VA-API decode → dmabuf → GTK4 | working on the dev PC (decode ≈ 2 ms) |
-| Linux client webview UI (`--features webview`) | written; needs `webkitgtk-6.0` to build |
+| Linux client webview UI (`--features webview`) | working: discover → connect → apps → stream (1440p144 from the UI) |
 | Pi 5 V4L2-request decode path | written; untested on hardware |
 | iPad app | written; needs a Mac to build (untested) |
 | Input (kbd/mouse/touch/gamepad), audio | written; host side runs, not yet verified end to end |
