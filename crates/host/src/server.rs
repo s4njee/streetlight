@@ -437,6 +437,8 @@ fn start_session(state: &AppState, req: StreamRequest, owner: u64, client: Strin
     {
         let target = state.output_target.clone();
         let gen_ = { let mut t = target.lock().unwrap(); t.generation += 1; t.name = kwin_output.clone(); t.map = None; t.generation };
+        // Where the output should sit: its logical size at the client's scale
+        let logical = ((w as f64 / scale).round() as i32, (h as f64 / scale).round() as i32);
         std::thread::spawn(move || {
             if kwin_output.is_empty() {
                 return;
@@ -445,11 +447,16 @@ fn start_session(state: &AppState, req: StreamRequest, owner: u64, client: Strin
             if map.is_none() {
                 tracing::warn!("output {kwin_output} not found in layout; absolute input unmapped");
             }
-            let mut t = target.lock().unwrap();
-            if t.generation == gen_ {
+            let mut mine = {
+                let mut t = target.lock().unwrap();
+                if t.generation != gen_ {
+                    return;
+                }
                 t.map = map;
                 t.generation += 1;
-            }
+                t.generation
+            };
+            follow_layout(&target, &kwin_output, logical, scale, map, &mut mine);
         });
     }
     *state.session.lock().unwrap() = Some(Session { app, video, _audio: audio, adaptive: adaptive::Controller::new(bitrate, Instant::now()), adapt_enabled: settings.adaptive_bitrate, cursor_metadata, cursor_epoch:u64::from_le_bytes(token[..8].try_into().unwrap()) });
@@ -669,5 +676,73 @@ mod tests {
         assert!(reserve_pair(&mut pending, &mut recent, now + Duration::from_secs(1), ip, 3, "retry".into(), "fp".into()).is_err());
         assert!(pending.is_none());
         assert!(reserve_pair(&mut pending, &mut recent, now + Duration::from_secs(5), ip, 4, "retry".into(), "fp".into()).is_ok());
+    }
+}
+
+
+/// Keeps absolute input mapped while `output` is this stream's target, and
+/// the output beside the others at `logical` size and `scale`
+/// (`layout::arrange`). The new output can change after it first appears:
+/// KScreen applies its own configuration to an output it hasn't seen, and
+/// set an iPad's 2732×2048 scale-2 output (1366×1024 logical) back to scale
+/// 1 (2732×2048 logical) a moment later, so a map made at first sight sent
+/// touches to half their distance from the top-left. Re-reads the layout
+/// every second; stops when another stream takes the target or the output
+/// has been gone a while.
+fn follow_layout(
+    target: &input::SharedTarget,
+    output: &str,
+    logical: (i32, i32),
+    scale: f64,
+    mut last: Option<crate::capture::layout::AbsMap>,
+    mine: &mut u64,
+) {
+    let mut missing = 0;
+    // Arranging more than this means something else keeps undoing it
+    let mut arrangements = 0;
+    loop {
+        if arrangements < 5 {
+            match crate::capture::layout::arrange(output, logical, scale) {
+                Ok(true) => arrangements += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!("arranging {output}: {e:#}");
+                    arrangements = 5;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        if target.lock().unwrap().generation != *mine {
+            return;
+        }
+        let map = match crate::capture::layout::query(output) {
+            Ok(Some(m)) => {
+                missing = 0;
+                m
+            }
+            Ok(None) => {
+                missing += 1;
+                if missing >= 3 {
+                    return;
+                }
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!("output layout: {e:#}");
+                return;
+            }
+        };
+        if last == Some(map) {
+            continue;
+        }
+        let mut t = target.lock().unwrap();
+        if t.generation != *mine {
+            return;
+        }
+        tracing::info!(?map, "output {output} moved or resized; absolute input remapped");
+        t.map = Some(map);
+        t.generation += 1;
+        *mine = t.generation;
+        last = Some(map);
     }
 }

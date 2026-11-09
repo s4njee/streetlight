@@ -50,6 +50,52 @@ struct State {
 
 /// Query the layout; returns None if `output_name` doesn't exist (yet).
 pub fn query(output_name: &str) -> Result<Option<AbsMap>> {
+    let rects = outputs()?;
+    let Some(output) = rects.iter().find(|(n, _)| n.as_deref() == Some(output_name)).map(|(_, r)| *r) else {
+        return Ok(None);
+    };
+    let x0 = rects.iter().map(|(_, r)| r.x).min().unwrap();
+    let y0 = rects.iter().map(|(_, r)| r.y).min().unwrap();
+    let x1 = rects.iter().map(|(_, r)| r.x + r.w).max().unwrap();
+    let y1 = rects.iter().map(|(_, r)| r.y + r.h).max().unwrap();
+    Ok(Some(AbsMap { output, desktop: Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } }))
+}
+
+/// Puts `output_name` beside the other outputs, at `size` logical pixels
+/// (its mode divided by `scale`), if it isn't: KWin places a new virtual
+/// output where it likes (on top of HDMI-A-1 on the dev PC, so a game full
+/// screen there showed only partly), and KScreen gives an output it hasn't
+/// seen its own scale (1, so an iPad's 2732×2048 desktop came out tiny).
+/// Through `kscreen-doctor`, which KScreen then remembers for that output.
+/// Returns whether it changed anything.
+pub fn arrange(output_name: &str, size: (i32, i32), scale: f64) -> Result<bool> {
+    let rects = outputs()?;
+    let Some(this) = rects.iter().find(|(n, _)| n.as_deref() == Some(output_name)).map(|(_, r)| *r) else {
+        return Ok(false);
+    };
+    let others: Vec<Rect> = rects.iter().filter(|(n, _)| n.as_deref() != Some(output_name)).map(|(_, r)| *r).collect();
+    let right = others.iter().map(|r| r.x + r.w).max().unwrap_or(0);
+    let top = others.iter().map(|r| r.y).min().unwrap_or(0);
+    let overlaps = others.iter().any(|r| this.x < r.x + r.w && r.x < this.x + this.w && this.y < r.y + r.h && r.y < this.y + this.h);
+    let sized = (this.w - size.0).abs() <= 1 && (this.h - size.1).abs() <= 1;
+    if !overlaps && sized {
+        return Ok(false);
+    }
+    let x = if overlaps { right } else { this.x };
+    let y = if overlaps { top } else { this.y };
+    let status = std::process::Command::new("kscreen-doctor")
+        .arg(format!("output.{output_name}.position.{x},{y}"))
+        .arg(format!("output.{output_name}.scale.{scale}"))
+        .stdout(std::process::Stdio::null())
+        .status()
+        .context("running kscreen-doctor")?;
+    anyhow::ensure!(status.success(), "kscreen-doctor failed: {status}");
+    tracing::info!(output_name, x, y, scale, "virtual output placed beside the others");
+    Ok(true)
+}
+
+/// Every output's name and logical rectangle (xdg-output).
+fn outputs() -> Result<Vec<(Option<String>, Rect)>> {
     let conn = Connection::connect_to_env().context("connect to Wayland")?;
     let (globals, mut queue) = registry_queue_init::<State>(&conn)?;
     let qh = queue.handle();
@@ -64,22 +110,14 @@ pub fn query(output_name: &str) -> Result<Option<AbsMap>> {
     }
     queue.roundtrip(&mut state)?;
     queue.roundtrip(&mut state)?;
-    let rects: Vec<(Option<String>, Rect)> = state
+    Ok(state
         .outs
         .iter()
         .filter_map(|(_, o)| {
             let ((x, y), (w, h)) = (o.pos?, o.size?);
             Some((o.name.clone(), Rect { x, y, w, h }))
         })
-        .collect();
-    let Some(output) = rects.iter().find(|(n, _)| n.as_deref() == Some(output_name)).map(|(_, r)| *r) else {
-        return Ok(None);
-    };
-    let x0 = rects.iter().map(|(_, r)| r.x).min().unwrap();
-    let y0 = rects.iter().map(|(_, r)| r.y).min().unwrap();
-    let x1 = rects.iter().map(|(_, r)| r.x + r.w).max().unwrap();
-    let y1 = rects.iter().map(|(_, r)| r.y + r.h).max().unwrap();
-    Ok(Some(AbsMap { output, desktop: Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } }))
+        .collect())
 }
 
 /// Poll until the output shows up (a new virtual output appears asynchronously).
