@@ -1,0 +1,14 @@
+# Optional user service for an existing Wayland session; install, then enable explicitly.
+[Unit]
+Description=Streetlight streaming client
+After=graphical-session.target pipewire.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/streetlight-client
+Restart=on-failure
+RestartSec=3
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=graphical-session.target

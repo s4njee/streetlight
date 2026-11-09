@@ -21,6 +21,10 @@ pub struct Settings {
     pub rc_mode: String,
     /// Draw the cursor into the video (true) or hide it.
     pub embed_cursor: bool,
+    /// Reduce encoder bitrate on sustained loss/RTT growth, recover when clean.
+    pub adaptive_bitrate: bool,
+    /// Required before allowing HDR10. Values must describe the streamed content/mastering.
+    pub hdr_metadata: Option<crate::hdr::Metadata>,
     pub apps: Vec<App>,
 }
 
@@ -30,6 +34,9 @@ pub struct App {
     pub name: String,
     /// Shell command run (detached) when a client launches this app.
     pub command: Option<String>,
+    /// Stop the process group we launched when its stream ends. False preserves detached behavior.
+    #[serde(default)]
+    pub stop_on_disconnect: bool,
 }
 
 impl Default for Settings {
@@ -40,9 +47,11 @@ impl Default for Settings {
             max_bitrate_kbps: 300_000,
             rc_mode: "VBR".into(),
             embed_cursor: true,
+            adaptive_bitrate: true,
+            hdr_metadata: None,
             apps: vec![
-                App { id: "desktop".into(), name: "Desktop".into(), command: None },
-                App { id: "steam".into(), name: "Steam Big Picture".into(), command: Some("steam steam://open/bigpicture".into()) },
+                App { id: "desktop".into(), name: "Desktop".into(), command: None, stop_on_disconnect: false },
+                App { id: "steam".into(), name: "Steam Big Picture".into(), command: Some("steam steam://open/bigpicture".into()), stop_on_disconnect: false },
             ],
         }
     }

@@ -1,5 +1,8 @@
 //! Dev tool: fullscreen window on a given output that logs every input event it gets.
 //!   cargo run --example input_probe -- streetlight-<client>
+#[path="../src/pointer_lock.rs"]
+#[allow(dead_code)]
+mod pointer_lock;
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 
@@ -54,15 +57,46 @@ fn main() -> glib::ExitCode {
             None => println!("0 MONITOR {target} not found; plain window"),
         }
         w.present();
-        let w2 = w.clone();
-        let found = mon.is_some();
-        glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
-            println!("{} SIZE {}x{} active={}", ts(), w2.width(), w2.height(), w2.is_active());
-            // Tell the selftest it may send keyboard/mouse input (only when we own focus on the target output).
-            if let (true, true, Some(gate)) = (found, w2.is_active(), std::env::var_os("SL_SELFTEST_GATE")) {
-                let _ = std::fs::write(gate, b"ready");
-                println!("{} GATE open", ts());
+        let lock=std::rc::Rc::new(std::cell::RefCell::new(None::<pointer_lock::PointerLock>));
+        let lock_tick=lock.clone();
+        let mut was_locked=false;
+        glib::timeout_add_local(std::time::Duration::from_millis(4),move || {
+            if let Some(lock)=lock_tick.borrow_mut().as_mut() {
+                if let Err(e)=lock.dispatch() {eprintln!("POINTER_LOCK error: {e:#}");}
+                if lock.active()!=was_locked { was_locked=lock.active();println!("POINTER_LOCK active={was_locked}"); }
             }
+            glib::ControlFlow::Continue
+        });
+        let w2 = w.clone();
+        let mut gate_open = false;
+        let gate = std::env::var_os("SL_SELFTEST_GATE");
+        let expected = mon.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+            let on_target = w2.surface().and_then(|s| s.display().monitor_at_surface(&s)) == expected;
+            let ready = expected.is_some() && on_target && w2.is_active() && w2.is_fullscreen();
+            if std::env::var_os("SL_PROBE_POINTER_LOCK").is_some() {
+                if ready && lock.borrow().is_none() {
+                    if let Some(surface)=w2.surface() {
+                        match pointer_lock::PointerLock::new(&surface,|dx,dy|println!("RELATIVE {dx} {dy}")) {
+                            Ok(mut pointer)=>{pointer.set_enabled(true).unwrap();*lock.borrow_mut()=Some(pointer);println!("POINTER_LOCK requested");}
+                            Err(e)=>eprintln!("POINTER_LOCK unavailable: {e:#}"),
+                        }
+                    }
+                } else if !ready { lock.borrow_mut().take(); }
+            }
+            if let Some(path) = &gate {
+                if ready {
+                    let _ = std::fs::write(path, format!("ready {}", std::process::id()));
+                } else if gate_open {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+            if ready != gate_open {
+                println!("{} GATE {} size={}x{} active={} fullscreen={}", ts(), if ready { "open" } else { "closed" },
+                    w2.width(), w2.height(), w2.is_active(), w2.is_fullscreen());
+                gate_open = ready;
+            }
+            glib::ControlFlow::Continue
         });
         // Flush stdout promptly for the test harness.
         glib::timeout_add_local(std::time::Duration::from_millis(100), || {

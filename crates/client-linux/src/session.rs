@@ -24,6 +24,8 @@ struct Sink {
 }
 
 impl MediaSink for Sink {
+    fn configure(&mut self, info: &StreamInfo) -> Result<()> { self.codec = info.codec; Ok(()) }
+    fn audio_lost(&mut self) { self.audio(&[]); }
     fn video(&mut self, f: VideoFrame) {
         if self.decoder.is_none() {
             match Decoder::new(self.codec) {
@@ -37,8 +39,11 @@ impl MediaSink for Sink {
         let t0 = now_us();
         match self.decoder.as_mut().unwrap().decode(&f.data) {
             Ok(Some(pic)) => {
-                let decode_us = (now_us() - t0) as u32;
-                if self.mailbox.put(pic, f.received_us, decode_us) {
+                let decoded_us = now_us();
+                let Some(c) = self.client.upgrade() else { return };
+                c.report_decode((decoded_us - t0) as u32);
+                let captured_us = c.host_to_local_us(f.capture_us);
+                if self.mailbox.put(pic, decoded_us, captured_us) {
                     (self.wake)();
                 }
             }
@@ -46,6 +51,7 @@ impl MediaSink for Sink {
             Err(e) => {
                 tracing::warn!("decode: {e:#}");
                 if let Some(c) = self.client.upgrade() {
+                    c.report_decode_error();
                     c.request_idr();
                 }
             }
@@ -53,49 +59,79 @@ impl MediaSink for Sink {
     }
 
     fn audio(&mut self, packet: &[u8]) {
+        if crate::audio::DISABLED.load(Ordering::Relaxed) { return; }
         if self.audio.is_none() && !self.audio_tried {
             self.audio_tried = true;
             self.audio = AudioOut::new().map_err(|e| tracing::warn!("audio disabled: {e:#}")).ok();
         }
-        if let Some(a) = self.audio.as_mut() {
+        let failed = if let Some(a) = self.audio.as_mut() {
             a.push(packet);
+            let (underruns, errors) = a.counters();
+            if let Some(c) = self.client.upgrade() { c.report_audio_stats(underruns, errors); }
+            errors != 0
+        } else { false };
+        if failed {
+            // Stop the backend worker promptly; a failed ALSA poll can otherwise spin.
+            self.audio.take();
         }
     }
 }
 
+type Present = Arc<glib::thread_guard::ThreadGuard<Box<dyn Fn()>>>;
+
 pub struct Session {
     pub info: StreamInfo,
     stop: Arc<AtomicBool>,
+    client: Arc<Client>,
+    // Keep the owner on the GTK thread until after the media sink has stopped.
+    _present: Present,
+    _main_thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.client.stop();
     }
 }
 
-/// `present` is invoked on the GTK main thread whenever a new frame is waiting.
-pub fn start(client: &Arc<Client>, req: StreamRequest, mailbox: Arc<FrameMailbox>, present: impl Fn() + 'static) -> Result<Session> {
-    // Wake the main loop at high priority, at most once per pending frame.
-    let present = glib::thread_guard::ThreadGuard::new(present);
-    let present = Arc::new(present);
+fn prepare(client: &Arc<Client>, codec: streetlight_client_core::Codec, mailbox: Arc<FrameMailbox>, present: impl Fn() + 'static) -> (Sink, Present) {
+    let present = Arc::new(glib::thread_guard::ThreadGuard::new(Box::new(present) as Box<dyn Fn()>));
+    let owner = present.clone();
     let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         let p = present.clone();
-        glib::MainContext::default().invoke_with_priority(glib::Priority::HIGH, move || (p.get_ref())());
+        glib::idle_add_full(glib::Priority::HIGH, move || { (p.get_ref())(); glib::ControlFlow::Break });
     });
-    let sink = Sink {
-        decoder: None,
-        codec: req.codec,
-        mailbox,
-        wake,
-        audio: None,
-        audio_tried: false,
-        client: Arc::downgrade(client),
-    };
-    let info = client.start(req, sink)?;
+    (Sink { decoder: None, codec, mailbox, wake, audio: None, audio_tried: false, client: Arc::downgrade(client) }, owner)
+}
+
+fn finish(client: Arc<Client>, info: StreamInfo, present: Present) -> Session {
     let stop = Arc::new(AtomicBool::new(false));
-    spawn_gamepads(Arc::downgrade(client), stop.clone());
-    Ok(Session { info, stop })
+    if crate::INPUT_ENABLED.load(Ordering::Relaxed) { spawn_gamepads(Arc::downgrade(&client), stop.clone()); }
+    Session { info, stop, client, _present: present, _main_thread: std::marker::PhantomData }
+}
+
+/// Direct CLI path. The callback and its owner are always created on the GTK thread.
+pub fn start(client: &Arc<Client>, req: StreamRequest, mailbox: Arc<FrameMailbox>, present: impl Fn() + 'static) -> Result<Session> {
+    let (sink, owner) = prepare(client, req.codec, mailbox, present);
+    let info = client.start(req, sink)?;
+    Ok(finish(client.clone(), info, owner))
+}
+
+/// Webview path: only transport startup runs on a worker. GTK closures are created,
+/// invoked and dropped on the main thread, including the failure path.
+#[cfg(feature = "webview")]
+pub fn start_async(client: Arc<Client>, req: StreamRequest, mailbox: Arc<FrameMailbox>, present: impl Fn() + 'static,
+    done: impl FnOnce(Result<Session>) + 'static) {
+    let (sink, owner) = prepare(&client, req.codec, mailbox, present);
+    let done = glib::thread_guard::ThreadGuard::new(done);
+    thread::spawn(move || {
+        let result = client.start(req, sink);
+        glib::idle_add_once(move || {
+            let result = result.map(|info| finish(client, info, owner));
+            done.into_inner()(result);
+        });
+    });
 }
 
 fn spawn_gamepads(client: std::sync::Weak<Client>, stop: Arc<AtomicBool>) {

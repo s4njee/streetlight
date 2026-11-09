@@ -94,7 +94,7 @@ impl Injector {
         for b in MOUSE_BUTTONS {
             abs_keys.insert(b);
         }
-        let abs_dev = VirtualDevice::builder()?
+        let mut abs_dev = VirtualDevice::builder()?
             .name("Streetlight absolute pointer")
             .input_id(InputId::new(BusType::BUS_VIRTUAL, 0x5354, 0x0002, 1))
             .with_keys(&abs_keys)?
@@ -106,7 +106,7 @@ impl Injector {
         tkeys.insert(KeyCode::BTN_TOUCH);
         let mut props = AttributeSet::<evdev::PropType>::new();
         props.insert(evdev::PropType::DIRECT);
-        let touch = VirtualDevice::builder()?
+        let mut touch = VirtualDevice::builder()?
             .name("Streetlight touchscreen")
             .input_id(InputId::new(BusType::BUS_VIRTUAL, 0x5354, 0x0003, 1))
             .with_properties(&props)?
@@ -120,19 +120,26 @@ impl Injector {
             .build()?;
 
         let mut kbm = kbm;
-        // Relative motion must reach games 1:1: turn off KWin pointer acceleration for our
-        // virtual mouse (the client side already applied the user's own acceleration).
+        // uinput creation precedes compositor discovery. Wait before the first
+        // event, otherwise KWin can discard it while adding the new devices.
+        for dev in [&mut kbm, &mut abs_dev, &mut touch] {
+            if let Some(sys) = sysname(dev) {
+                let ready = (0..20).any(|_| {
+                    let ready = std::process::Command::new("busctl")
+                        .args(["--user", "--timeout=1", "get-property", "org.kde.KWin",
+                            &format!("/org/kde/KWin/InputDevice/{sys}"), "org.kde.KWin.InputDevice", "enabled"])
+                        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                        .status().is_ok_and(|s| s.success());
+                    if !ready { std::thread::sleep(std::time::Duration::from_millis(25)); }
+                    ready
+                });
+                if !ready { tracing::warn!("compositor did not discover input device {sys}"); }
+            }
+        }
+        // Relative motion must reach games 1:1; only our virtual mouse is changed.
         if let Some(sys) = sysname(&mut kbm) {
-            std::thread::spawn(move || {
-                for _ in 0..20 {
-                    if kwin_set(&sys, "pointerAccelerationProfileFlat", "b", "true") {
-                        kwin_set(&sys, "pointerAcceleration", "d", "0");
-                        return;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                tracing::warn!("couldn't disable pointer acceleration on {sys}");
-            });
+            kwin_set(&sys, "pointerAccelerationProfileFlat", "b", "true");
+            kwin_set(&sys, "pointerAcceleration", "d", "0");
         }
         Ok(Self { kbm, abs: abs_dev, touch, pads: HashMap::new(), touch_slots: [false; 10], target, applied_generation: u64::MAX, map: None, last_abs: (u16::MAX, u16::MAX) })
     }
@@ -198,7 +205,6 @@ impl Injector {
             InputEvent::GamepadDisconnected { id } => {
                 self.pads.remove(&id);
             }
-            InputEvent::Text(ref t) => tracing::debug!("text input not supported yet: {t:?}"),
         }
         Ok(())
     }

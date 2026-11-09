@@ -82,6 +82,7 @@
       <label for="max_bitrate_kbps">Max bitrate (kbps)</label><input id="max_bitrate_kbps" type="number" min="1000" step="1000">
       <label for="rc_mode">Rate control</label>
       <select id="rc_mode"><option>VBR</option><option>CBR</option><option>QVBR</option></select>
+      <label for="adaptive_bitrate">Adapt bitrate to network</label><input id="adaptive_bitrate" type="checkbox" style="justify-self:start">
       <label for="embed_cursor">Draw cursor in video</label><input id="embed_cursor" type="checkbox" style="justify-self:start">
       <span></span><div class="row"><button class="primary">Save</button><span id="savemsg" class="muted"></span></div>
     </form>
@@ -101,9 +102,19 @@
 <script>
 const $ = id => document.getElementById(id);
 let settings = null;
+let savedCommands = "";
+const token = "__STREETLIGHT_TOKEN__";
+const commands = () => {
+  const byId = new Map();
+  for (const a of settings.apps) {
+    if (!byId.has(a.id)) byId.set(a.id, []);
+    byId.get(a.id).push(a.command ?? null);
+  }
+  return JSON.stringify([...byId].filter(([, cmds]) => cmds.some(c => c != null)).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
+};
 
 async function api(path, opts = {}) {
-  const r = await fetch(path, { headers: { "content-type": "application/json" }, ...opts });
+  const r = await fetch(path, { ...opts, headers: { "content-type": "application/json", "X-Streetlight-Token": token, ...opts.headers } });
   if (!r.ok) throw new Error(r.statusText);
   return r.status === 204 ? null : r.json();
 }
@@ -134,6 +145,7 @@ async function refresh() {
       [fb.decode_us_avg != null ? (fb.decode_us_avg / 1000).toFixed(2) + " ms" : "–", "client decode"],
       [fb.frames_lost != null ? `${fb.frames_lost} / ${fb.frames_recovered}` : "–", "lost / FEC-recovered"],
     ];
+    if (st.app_id) cells.push([`${st.app_id} · PID ${st.app_pid} · ${st.app_running ? "running" : "exited"}`, "launched app"]);
     $("stats").replaceChildren(...cells.map(([v, l]) => { const d = document.createElement("div"); d.append(text(document.createElement("b"), v), text(document.createElement("span"), l)); return d; }));
   }
 
@@ -160,20 +172,33 @@ function renderApps() {
     const tr = document.createElement("tr");
     const b = document.createElement("button"); b.className = "danger"; b.textContent = "Remove";
     b.onclick = () => { settings.apps.splice(i, 1); saveSettings(); };
-    tr.append(td(a.name), td(a.command || "—"), td(b));
+    const policy = document.createElement("label");
+    const stop = document.createElement("input"); stop.type = "checkbox"; stop.checked = !!a.stop_on_disconnect;
+    stop.onchange = () => { a.stop_on_disconnect = stop.checked; saveSettings(); };
+    policy.append(stop, " Stop launched process on disconnect");
+    const actions = document.createElement("div"); actions.append(policy, b);
+    tr.append(td(a.name), td(a.command || "—"), td(actions));
     return tr;
   }));
 }
 
 async function loadSettings() {
   settings = await api("/api/settings");
+  savedCommands = commands();
   for (const k of ["host_name", "render_node", "max_bitrate_kbps", "rc_mode"]) $(k).value = settings[k];
   $("embed_cursor").checked = settings.embed_cursor;
+  $("adaptive_bitrate").checked = settings.adaptive_bitrate;
   renderApps();
 }
 
 async function saveSettings() {
-  await api("/api/settings", { method: "PUT", body: JSON.stringify(settings) });
+  const changed = commands() !== savedCommands;
+  if (changed && !confirm("Change app commands? These commands run on the host when a paired client launches the app.")) {
+    await loadSettings();
+    return;
+  }
+  await api("/api/settings", { method: "PUT", body: JSON.stringify({ ...settings, confirm: changed }) });
+  savedCommands = commands();
   text($("savemsg"), "Saved.");
   renderApps();
 }
@@ -185,6 +210,7 @@ $("settings").onsubmit = e => {
   settings.max_bitrate_kbps = +$("max_bitrate_kbps").value;
   settings.rc_mode = $("rc_mode").value;
   settings.embed_cursor = $("embed_cursor").checked;
+  settings.adaptive_bitrate = $("adaptive_bitrate").checked;
   saveSettings();
 };
 

@@ -1,15 +1,6 @@
 //! streetlight-host: game/desktop streaming server.
 
-mod audio;
-mod capture;
-mod config;
-mod encode;
-mod gpu;
-mod input;
-mod media;
-mod server;
-mod video;
-mod web;
+use streetlight_host::{capture, config, encode, media, server, video, web};
 
 use std::io::Write;
 
@@ -19,7 +10,7 @@ use streetlight_proto::control::{CONTROL_PORT, Codec, MDNS_SERVICE, MEDIA_PORT, 
 const USAGE: &str = "usage:
   streetlight-host [serve]              run the host (QUIC 47800, media 47801, web UI 127.0.0.1:47990)
   streetlight-host pair <PIN>           approve a pending pairing with the PIN shown on the client
-  streetlight-host capture-test [secs] [out.hevc] [WxH]   capture a virtual display to a file";
+  streetlight-host capture-test [secs] [out.hevc] [WxH] [--hdr]   capture a virtual display to a file";
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -81,6 +72,8 @@ fn capture_test(args: &[String]) -> Result<()> {
         .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
         .unwrap_or((1920u32, 1080u32));
     let settings = config::Settings::load();
+    let hdr=args.iter().any(|a|a=="--hdr");
+    let metadata=if hdr {let m=settings.hdr_metadata.clone().ok_or_else(||anyhow::anyhow!("HDR requires configured mastering metadata"))?;m.validate()?;Some(m)}else{None};
     let mut file = std::fs::File::create(&out)?;
     let cfg = video::VideoConfig {
         source: capture::virtual_output::Source::Virtual { name: "streetlight-test".into(), width: w, height: h, scale: 1.0 },
@@ -91,7 +84,9 @@ fn capture_test(args: &[String]) -> Result<()> {
             height: h,
             fps: 60,
             bitrate_kbps: 40_000,
-            ten_bit: false,
+            ten_bit: hdr,
+            hdr_metadata: metadata,
+            color: if hdr {streetlight_proto::control::ColorSpace::Hdr10}else{streetlight_proto::control::ColorSpace::Sdr709},
             render_node: settings.render_node,
             rc_mode: settings.rc_mode,
         },

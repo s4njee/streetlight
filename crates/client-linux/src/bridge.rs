@@ -25,6 +25,8 @@ struct Ui {
     window: gtk4::ApplicationWindow,
     client: Option<Arc<Client>>,
     session: Option<Session>,
+    starting: bool,
+    start_generation: u64,
 }
 
 thread_local! {
@@ -65,7 +67,13 @@ pub fn install(window: &gtk4::ApplicationWindow, view: Rc<StreamView>) {
         let _ = &v2;
         end_stream(Some("returned to menu".into()));
     }));
-    UI.with(|u| *u.borrow_mut() = Some(Ui { webview, view, window: window.clone(), client: None, session: None }));
+    UI.with(|u| *u.borrow_mut() = Some(Ui { webview, view, window: window.clone(), client: None, session: None, starting: false, start_generation: 0 }));
+
+    window.connect_close_request(|_| {
+        end_stream(None);
+        if let Some(c) = client() { c.stop(); }
+        glib::Propagation::Proceed
+    });
 
     // Watch for the host ending the stream / dropping the connection.
     glib::timeout_add_local(Duration::from_millis(500), || {
@@ -80,6 +88,14 @@ pub fn install(window: &gtk4::ApplicationWindow, view: Rc<StreamView>) {
         }
         glib::ControlFlow::Continue
     });
+}
+
+/// Release transport runtimes before Rust destroys the main thread's Tokio TLS.
+pub fn shutdown() {
+    if UI.with(|u| u.borrow().is_some()) {
+        end_stream(None);
+        UI.with(|u| { u.borrow_mut().take(); });
+    }
 }
 
 fn js(script: String) {
@@ -155,54 +171,78 @@ fn handle(msg: Value) {
             let Some(c) = client() else { return resolve(id, Err("not connected".into())) };
             background(id, move || c.apps().map(|a| json!(a.iter().map(|a| json!({"id": a.id, "name": a.name})).collect::<Vec<_>>())).map_err(err));
         }
-        "getSettings" => resolve(id, Ok(json!(Settings::load()))),
+        "getSettings" => {
+            let mut settings=json!(Settings::load());settings["hdr_supported"]=json!(crate::decode::supports_hdr());
+            resolve(id,Ok(settings));
+        },
         "setSettings" => {
             let r = serde_json::from_value::<Settings>(args).map_err(|e| e.to_string()).and_then(|s| s.save().map_err(|e| e.to_string()));
             resolve(id, r.map(|_| Value::Null));
         }
-        "start" => resolve(id, start_stream(args["app"].as_str().map(String::from))),
+        "start" => start_stream(id, args["app"].as_str().map(String::from)),
         "stop" => {
             end_stream(None);
             resolve(id, Ok(Value::Null));
         }
         "stats" => resolve(id, Ok(client().map(|c| json!(c.stats())).unwrap_or(Value::Null))),
-        "quit" => UI.with(|u| {
-            if let Some(u) = u.borrow().as_ref() {
-                u.window.close();
-            }
-        }),
+        "quit" => {
+            let window = UI.with(|u| u.borrow().as_ref().map(|u| u.window.clone()));
+            if let Some(window) = window { window.close(); }
+        },
         other => resolve(id, Err(format!("unknown command {other}"))),
     }
 }
 
-fn start_stream(app: Option<String>) -> Result<Value, String> {
-    let (client, view, window, webview) = UI.with(|u| {
-        let u = u.borrow();
-        let u = u.as_ref().unwrap();
-        (u.client.clone(), u.view.clone(), u.window.clone(), u.webview.clone())
+fn start_stream(id: u64, app: Option<String>) {
+    let state = UI.with(|u| {
+        let mut u = u.borrow_mut();
+        let u = u.as_mut().unwrap();
+        if u.starting || u.session.is_some() { return None; }
+        let client = u.client.clone()?;
+        u.starting = true;
+        u.start_generation += 1;
+        Some((client, u.view.clone(), u.window.clone(), u.start_generation))
     });
-    let client = client.ok_or("not connected")?;
+    let Some((client, view, window, generation)) = state else { return resolve(id, Err("not connected or stream already starting".into())) };
     let req = Settings::load().request(app, &Overrides::default(), crate::native_mode(&window));
     let mailbox = FrameMailbox::new();
     let (v, mb) = (view.clone(), mailbox.clone());
-    let sess = session::start(&client, req, mailbox, move || v.present(&mb)).map_err(|e| format!("{e:#}"))?;
-    let info = json!({ "width": sess.info.width, "height": sess.info.height, "fps": sess.info.fps, "codec": format!("{:?}", sess.info.codec) });
-    view.attach(Some(client), (sess.info.width, sess.info.height));
-    // Hide the webview entirely so the video surface can be scanned out directly.
-    webview.set_visible(false);
-    UI.with(|u| u.borrow_mut().as_mut().unwrap().session = Some(sess));
-    Ok(info)
+    let expected = client.clone();
+    session::start_async(client, req, mailbox, move || v.present(&mb), move |result| {
+        let current = UI.with(|u| {
+            let mut u = u.borrow_mut();
+            let Some(u) = u.as_mut() else { return false };
+            u.starting = false;
+            u.start_generation == generation && u.client.as_ref().is_some_and(|c| Arc::ptr_eq(c, &expected))
+        });
+        if !current { drop(result); return resolve(id, Err("stream start cancelled".into())); }
+        match result {
+            Ok(sess) => {
+                let color = UI.with(|u| u.borrow().as_ref().unwrap().view.set_stream_color(sess.info.color));
+                if let Err(e) = color { drop(sess); return resolve(id, Err(format!("{e:#}"))); }
+                let info = json!({ "width": sess.info.width, "height": sess.info.height, "fps": sess.info.fps, "codec": format!("{:?}", sess.info.codec) });
+                UI.with(|u| {
+                    let mut u = u.borrow_mut();
+                    let u = u.as_mut().unwrap();
+                    u.view.attach(Some(expected), (sess.info.width, sess.info.height));
+                    u.webview.set_visible(false);
+                    u.session = Some(sess);
+                });
+                resolve(id, Ok(info));
+            }
+            Err(e) => resolve(id, Err(format!("{e:#}"))),
+        }
+    });
 }
 
 fn end_stream(reason: Option<String>) {
     let had = UI.with(|u| {
         let mut u = u.borrow_mut();
         let u = u.as_mut().unwrap();
+        u.start_generation += 1;
+        if u.starting { if let Some(c) = &u.client { c.request_stop(); } }
         let had = u.session.take().is_some();
         if had {
-            if let Some(c) = &u.client {
-                c.stop();
-            }
             u.view.attach(None, (0, 0));
             u.webview.set_visible(true);
             u.webview.grab_focus();

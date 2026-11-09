@@ -7,7 +7,7 @@ fn main() {
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
     bindgen::Builder::default()
         .header_contents("va_wrap.h", "#include <va/va.h>\n#include <va/va_drmcommon.h>\n#include <va/va_vpp.h>\n")
-        .allowlist_function("va(CreateSurfaces|DestroySurfaces|CreateConfig|DestroyConfig|CreateContext|DestroyContext|CreateBuffer|DestroyBuffer|BeginPicture|RenderPicture|EndPicture|SyncSurface|ErrorStr|ExportSurfaceHandle|QueryVendorString)")
+        .allowlist_function("va(CreateSurfaces|DestroySurfaces|CreateConfig|DestroyConfig|CreateContext|DestroyContext|CreateBuffer|DestroyBuffer|BeginPicture|RenderPicture|EndPicture|SyncSurface|ErrorStr|ExportSurfaceHandle|QueryVendorString|MaxNumEntrypoints|QueryConfigEntrypoints)")
         .allowlist_type("VA.*|_VA.*")
         .allowlist_var("VA_.*")
         .derive_default(true)
@@ -16,4 +16,11 @@ fn main() {
         .expect("bindgen libva")
         .write_to_file(out.join("va.rs"))
         .unwrap();
+    bindgen::Builder::default()
+        .header_contents("hdr_wrap.h", "#include <libavutil/mastering_display_metadata.h>\n")
+        .allowlist_function("av_(mastering_display|content_light)_metadata_create_side_data")
+        .allowlist_type("AVMasteringDisplayMetadata|AVContentLightMetadata|AVRational")
+        .layout_tests(false).generate().expect("bindgen HDR metadata")
+        .write_to_file(out.join("hdr.rs")).unwrap();
+
 }

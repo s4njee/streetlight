@@ -4,7 +4,8 @@
 //!   DRM_PRIME frames directly (NV12 in Broadcom SAND128 column layout).
 //! * Desktop AMD/Intel: VA-API decode, then `av_hwframe_map` → DRM_PRIME (zero copy).
 
-use std::ffi::c_int;
+use std::ffi::{CString, c_int};
+use std::path::Path;
 use std::ptr;
 
 use anyhow::{Result, bail};
@@ -79,36 +80,38 @@ unsafe extern "C" fn get_format(ctx: *mut ff::AVCodecContext, fmts: *const ff::A
 
 impl Decoder {
     pub fn new(codec: Codec) -> Result<Self> {
-        let mut last_err = String::new();
+        let mut errors = Vec::new();
         for hw in [HwKind::Drm, HwKind::Vaapi] {
-            match unsafe { Self::try_new(codec, hw) } {
-                Ok(d) => return Ok(d),
-                Err(e) => last_err = format!("{e:#}"),
+            if hw == HwKind::Drm && !crate::drm::has_request_decoder() && std::env::var_os("SL_DRM_DEVICE").is_none() {
+                continue;
+            }
+            for node in crate::drm::decoder_candidates(hw == HwKind::Drm) {
+                match unsafe { Self::try_new(codec, hw, &node) } {
+                    Ok(d) => return Ok(d),
+                    Err(e) => errors.push(format!("{} via {hw:?}: {e:#}", node.display())),
+                }
             }
         }
-        bail!("no hardware decoder: {last_err}")
+        bail!("no hardware decoder: {}", errors.join("; "))
     }
 
-    unsafe fn try_new(codec: Codec, hw: HwKind) -> Result<Self> {
+    unsafe fn try_new(codec: Codec, hw: HwKind, node: &Path) -> Result<Self> {
         unsafe {
-            let id = match codec {
-                Codec::Hevc => ff::AVCodecID::AV_CODEC_ID_HEVC,
-                Codec::Av1 => ff::AVCodecID::AV_CODEC_ID_AV1,
-                Codec::H264 => ff::AVCodecID::AV_CODEC_ID_H264,
-            };
-            let dec = ff::avcodec_find_decoder(id);
+            // The generic AV1 lookup can choose libdav1d (software). Select the
+            // native decoder, whose get_format callback exposes VA-API/DRM.
+            let name = match codec { Codec::Hevc=>c"hevc", Codec::Av1=>c"av1", Codec::H264=>c"h264",
+                Codec::Auto=>bail!("decoder requires a negotiated codec") };
+            let dec = ff::avcodec_find_decoder_by_name(name.as_ptr());
             if dec.is_null() {
                 bail!("no decoder for {codec:?}");
             }
             let mut dev = ptr::null_mut();
-            let (ty, node) = match hw {
-                HwKind::Vaapi => (ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI, c"/dev/dri/renderD128"),
-                HwKind::Drm => (ff::AVHWDeviceType::AV_HWDEVICE_TYPE_DRM, c"/dev/dri/card0"),
+            let ty = match hw {
+                HwKind::Vaapi => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                HwKind::Drm => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_DRM,
             };
-            if hw == HwKind::Drm && !std::path::Path::new("/dev/video19").exists() && !std::path::Path::new("/proc/device-tree/model").exists() {
-                bail!("not a V4L2-request (Raspberry Pi) system");
-            }
-            let r = ff::av_hwdevice_ctx_create(&mut dev, ty, node.as_ptr(), ptr::null_mut(), 0);
+            let node_name = CString::new(node.as_os_str().as_encoded_bytes())?;
+            let r = ff::av_hwdevice_ctx_create(&mut dev, ty, node_name.as_ptr(), ptr::null_mut(), 0);
             if r < 0 {
                 bail!("{hw:?} device: error {r}");
             }
@@ -129,7 +132,7 @@ impl Decoder {
                 ff::avcodec_free_context(&mut c);
                 bail!("avcodec_open2: {r}");
             }
-            let description = format!("{} via {:?}", std::ffi::CStr::from_ptr((*dec).name).to_string_lossy(), hw);
+            let description = format!("{} via {:?} ({})", std::ffi::CStr::from_ptr((*dec).name).to_string_lossy(), hw, node.display());
             tracing::info!("decoder: {description}");
             Ok(Self { ctx, pkt: ff::av_packet_alloc(), hw, description })
         }
@@ -151,10 +154,11 @@ impl Decoder {
                 let r = ff::avcodec_receive_frame(self.ctx, f);
                 if r < 0 {
                     ff::av_frame_free(&mut f);
+                    if r != ff::AVERROR(libc::EAGAIN) && r != ff::AVERROR_EOF { bail!("receive_frame: {r}"); }
                     break;
                 }
                 // Keep only the newest picture (never queue latency).
-                out = self.to_dmabuf(f).ok();
+                out = Some(self.to_dmabuf(f)?);
             }
             Ok(out)
         }
@@ -214,4 +218,48 @@ impl Drop for Decoder {
             ff::avcodec_free_context(&mut self.ctx);
         }
     }
+}
+
+/// Query the actual VA driver VLD profiles, rather than advertising every FFmpeg codec.
+pub fn supported_codecs() -> Vec<Codec> {
+    static CODECS: std::sync::OnceLock<Vec<Codec>> = std::sync::OnceLock::new();
+    CODECS.get_or_init(|| {
+        let mut codecs = Vec::new();
+        for node in crate::drm::decoder_candidates(false) {
+            if let Ok(found) = va_decode_profiles(&node,false) { for codec in found { if !codecs.contains(&codec) { codecs.push(codec); } } }
+        }
+        codecs
+    }).clone()
+}
+
+fn va_decode_profiles(node: &Path,hdr:bool) -> Result<Vec<Codec>> {
+    use std::os::fd::AsRawFd;
+    unsafe {
+        let va = libloading::Library::new("libva.so.2")?;
+        let drm = libloading::Library::new("libva-drm.so.2")?;
+        let get = drm.get::<unsafe extern "C" fn(i32) -> *mut libc::c_void>(b"vaGetDisplayDRM")?;
+        let init = va.get::<unsafe extern "C" fn(*mut libc::c_void,*mut i32,*mut i32)->i32>(b"vaInitialize")?;
+        let terminate = va.get::<unsafe extern "C" fn(*mut libc::c_void)->i32>(b"vaTerminate")?;
+        let max = va.get::<unsafe extern "C" fn(*mut libc::c_void)->i32>(b"vaMaxNumEntrypoints")?;
+        let query = va.get::<unsafe extern "C" fn(*mut libc::c_void,i32,*mut i32,*mut i32)->i32>(b"vaQueryConfigEntrypoints")?;
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(node)?;
+        let display = get(file.as_raw_fd());
+        anyhow::ensure!(!display.is_null() && init(display,&mut 0,&mut 0)==0,"VA initialization failed");
+        let mut codecs=Vec::new();
+        for (codec,profile) in [(Codec::Av1,32),(Codec::Hevc,if hdr {18} else {17}),(Codec::H264,7)] {
+            if hdr && codec!=Codec::Hevc {continue;}
+            let name=match codec{Codec::Av1=>c"av1",Codec::Hevc=>c"hevc",Codec::H264=>c"h264",Codec::Auto=>unreachable!()};
+            if ff::avcodec_find_decoder_by_name(name.as_ptr()).is_null(){continue;}
+            let mut entries=vec![0;max(display).max(0) as usize]; let mut count=0;
+            if query(display,profile,entries.as_mut_ptr(),&mut count)==0 && entries.iter().take(count.max(0) as usize).any(|&e| e==1) { codecs.push(codec); }
+        }
+        terminate(display);
+        Ok(codecs)
+    }
+}
+
+pub fn supports_hdr() -> bool {
+    static HDR:std::sync::OnceLock<bool>=std::sync::OnceLock::new();
+    *HDR.get_or_init(|| gtk4::minor_version()>=20 && !crate::drm::has_request_decoder()
+        && crate::drm::decoder_candidates(false).iter().any(|node|va_decode_profiles(node,true).is_ok_and(|c|c.contains(&Codec::Hevc))))
 }

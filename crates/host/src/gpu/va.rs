@@ -139,6 +139,8 @@ impl Display {
 pub enum OutputColor {
     /// BT.709 limited range (SDR).
     Bt709Limited,
+    /// BT.601 full range for legacy unmanaged YUV presentation.
+    Bt601Full,
     /// BT.2020 limited range (HDR10 path; transfer handled by source).
     Bt2020Limited,
 }
@@ -179,15 +181,31 @@ impl Vpp {
         p.filter_flags = VA_FILTER_SCALING_FAST;
         p.surface_color_standard = _VAProcColorStandardType_VAProcColorStandardSRGB;
         p.input_color_properties.color_range = VA_SOURCE_RANGE_FULL as u8;
+        if color==OutputColor::Bt2020Limited {
+            p.surface_color_standard=_VAProcColorStandardType_VAProcColorStandardExplicit;
+            p.input_color_properties.colour_primaries=9;
+            p.input_color_properties.transfer_characteristics=16;
+            p.input_color_properties.matrix_coefficients=0;
+        }
         match color {
             OutputColor::Bt709Limited => {
                 p.output_color_standard = _VAProcColorStandardType_VAProcColorStandardBT709;
             }
+            OutputColor::Bt601Full => {
+                // Keep sRGB primaries/TRC; only the YCbCr matrix is BT.601.
+                p.output_color_standard = _VAProcColorStandardType_VAProcColorStandardExplicit;
+                p.output_color_properties.colour_primaries = 1;
+                p.output_color_properties.transfer_characteristics = 13;
+                p.output_color_properties.matrix_coefficients = 5;
+            }
             OutputColor::Bt2020Limited => {
-                p.output_color_standard = _VAProcColorStandardType_VAProcColorStandardBT2020;
+                p.output_color_standard = _VAProcColorStandardType_VAProcColorStandardExplicit;
+                p.output_color_properties.colour_primaries=9;
+                p.output_color_properties.transfer_characteristics=16;
+                p.output_color_properties.matrix_coefficients=9;
             }
         }
-        p.output_color_properties.color_range = VA_SOURCE_RANGE_REDUCED as u8;
+        p.output_color_properties.color_range = if color == OutputColor::Bt601Full { VA_SOURCE_RANGE_FULL } else { VA_SOURCE_RANGE_REDUCED } as u8;
         p.output_color_properties.chroma_sample_location = VA_CHROMA_SITING_HORIZONTAL_LEFT as u8 | VA_CHROMA_SITING_VERTICAL_CENTER as u8;
 
         let mut buf: VABufferID = 0;

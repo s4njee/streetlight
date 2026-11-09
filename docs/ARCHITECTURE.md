@@ -50,10 +50,25 @@ web/client          client UI shared by Pi and iPad
 
 | Port | Proto | Use |
 |---|---|---|
-| 47800 | UDP (QUIC) | control, input, feedback |
+| 47800 | UDP (QUIC) | control, input, feedback, cursor shapes/positions |
 | 47801 | UDP | video + audio media |
 | 47990 | TCP (HTTP, loopback only) | host web UI |
 | mDNS | `_streetlight._udp.local` | discovery |
+
+## Current control protocol
+
+QUIC ALPN is `streetlight/3`; both peers must be rebuilt together. Client capability
+advertisement includes supported hardware codecs, HDR and cursor metadata. Auto codec
+selection intersects both peers' support; the Pi request decoder advertises HEVC only.
+Feedback carries the actual frame number, cumulative recovery/IDR counts, decode/present
+timing and RTT. The host adapts bitrate within the initial request and reopens only the
+encoder context, retaining capture and GPU conversion/import state.
+
+Cursor shapes use a reliable host-initiated QUIC stream, while small typed position
+datagrams remain independent from feedback/media. Epochs prevent stale-session state;
+serial numbers discard reordering. The GTK overlay scales/hotspots the cursor separately
+from video and can predict local absolute motion. Clients without that capability receive
+embedded cursors. See [P2.md](P2.md) for verification and HDR source limitations.
 
 ## Media packet (UDP, little endian)
 
@@ -72,7 +87,7 @@ web/client          client UI shared by Pi and iPad
 24  ..   AES-128-GCM(shard) || 16-byte tag    AAD = header, nonce = stream|frame|shard
 ```
 
-Every frame (an HEVC access unit, Annex B) is split into `data_shards` equal shards,
+Every frame (an HEVC/H.264 Annex-B access unit or AV1 low-overhead OBU temporal unit) is split into `data_shards` equal shards,
 `parity_shards = ceil(data_shards * fec_percent)` are added, every shard is encrypted
 and sent paced across a fraction of the frame interval. The client can rebuild the
 frame from **any** `data_shards` of the shards it receives. If a frame can't be

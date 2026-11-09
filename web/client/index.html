@@ -85,7 +85,14 @@ window.streetlight = (() => {
         native.postMessage(JSON.stringify({ id, cmd, args }));
       });
     },
-    on(name, fn) { (listeners[name] ||= []).push(fn); },
+    on(name, fn) {
+      (listeners[name] ||= []).push(fn);
+      return () => { listeners[name] = (listeners[name] || []).filter(f => f !== fn); };
+    },
+    once(name, fn) {
+      const off = this.on(name, data => { off(); fn(data); });
+      return off;
+    },
     __resolve(id, ok, value) {
       const p = pending.get(id); if (!p) return;
       pending.delete(id);
@@ -201,13 +208,13 @@ async function pair() {
       h("p", { class: "muted" }, "or run ", h("kbd", {}, "streetlight-host pair <PIN>")),
       h("p", { class: "muted" }, h("span", { class: "spinner" }), "  Waiting for the host…"),
       h("button", { class: "btn", "data-autofocus": true, onclick: current.back }, "Cancel")));
-  const off = pin => pinEl.textContent = pin;
-  sl.on("pairPin", d => off(d.pin));
+  const off = sl.once("pairPin", d => pinEl.textContent = d.pin);
   try {
     const r = await sl.call("pair");
     if (r.ok) { toast("Paired with " + connected.host_name); showApps(); }
     else { toast("Pairing failed — wrong PIN?", true); showHosts(); }
   } catch (e) { toast(e.message, true); showHosts(); }
+  finally { off(); }
 }
 
 const tileColors = ["#3a2a5e,#1b1530", "#173d3a,#0d1f1e", "#4a2a17,#24140b", "#1d3355,#0e1a2c", "#4b1d33,#260e1a"];
@@ -256,7 +263,9 @@ async function showSettings() {
       h("label", { for: "bitrate_kbps" }, "Bitrate"),
       sel("bitrate_kbps", [[20000, "20 Mbit/s"], [40000, "40 Mbit/s"], [80000, "80 Mbit/s"], [120000, "120 Mbit/s"], [150000, "150 Mbit/s"], [200000, "200 Mbit/s"], [300000, "300 Mbit/s"]]),
       h("label", { for: "codec" }, "Codec"),
-      sel("codec", [["Hevc", "HEVC (recommended; Pi 5 hardware)"], ["Av1", "AV1"], ["H264", "H.264"]]),
+      sel("codec", [["Auto", "Automatic (best shared hardware codec)"], ["Hevc", "HEVC (Pi 5 hardware)"], ["Av1", "AV1"], ["H264", "H.264"]]),
+      ...("hdr" in s ? [h("label", { for:"hdr" }, "HDR10 (requires host metadata and supported capture/display)"),
+        h("input", {id:"hdr",type:"checkbox",checked:!!s.hdr,disabled:s.hdr_supported===false,onchange:e=>s.hdr=e.target.checked})] : []),
       h("label", { for: "fec_percent" }, "Error correction"),
       sel("fec_percent", [[0, "Off (wired only)"], [10, "10 %"], [20, "20 %"], [35, "35 % (Wi-Fi)"], [50, "50 %"]]),
       h("label", { for: "pace_mbps" }, "Packet pacing"),

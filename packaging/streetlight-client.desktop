@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Streetlight
+Comment=Stream games and a desktop from your Streetlight host
+Exec=streetlight-client
+Terminal=false
+Categories=Network;Game;
+StartupNotify=true

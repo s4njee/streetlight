@@ -1,6 +1,7 @@
 //! Streetlight wire protocol, shared by host and clients.
 
 pub mod control;
+pub mod cursor;
 pub mod crypto;
 pub mod fec;
 pub mod media;

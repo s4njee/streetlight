@@ -25,10 +25,11 @@ pub struct Frame<'a> {
 
 pub enum Event<'a> {
     Frame(Frame<'a>),
+    Cursor(super::cursor::Update),
     /// Buffer is going away; drop any cached import keyed by it.
     BufferRemoved(usize),
     /// Negotiated format changed (size etc.); drop all cached imports.
-    FormatChanged { width: u32, height: u32, drm_format: u32, modifier: u64 },
+    FormatChanged { width: u32, height: u32, drm_format: u32, modifier: u64, hdr: bool },
 }
 
 pub enum Control {
@@ -54,9 +55,9 @@ fn serialize(obj: Object) -> Vec<u8> {
         .into_inner()
 }
 
-fn enum_format(fmt: VideoFormat, modifiers: &[u64], size: (u32, u32), max_fps: u32) -> Vec<u8> {
+fn enum_format(fmt: VideoFormat, modifiers: &[u64], size: (u32, u32), max_fps: u32, hdr: bool) -> Vec<u8> {
     let mods: Vec<i64> = modifiers.iter().map(|&m| m as i64).collect();
-    serialize(Object {
+    let mut object=Object {
         type_: SpaTypes::ObjectParamFormat.as_raw(),
         id: spa::param::ParamType::EnumFormat.as_raw(),
         properties: vec![
@@ -95,7 +96,16 @@ fn enum_format(fmt: VideoFormat, modifiers: &[u64], size: (u32, u32), max_fps: u
                 ))),
             ),
         ],
-    })
+    };
+    if hdr {
+        object.properties.extend([
+            Property::new(FormatProperties::VideoColorRange.as_raw(),Value::Id(Id(spa::sys::SPA_VIDEO_COLOR_RANGE_0_255))),
+            Property::new(FormatProperties::VideoColorMatrix.as_raw(),Value::Id(Id(spa::sys::SPA_VIDEO_COLOR_MATRIX_RGB))),
+            Property::new(FormatProperties::VideoTransferFunction.as_raw(),Value::Id(Id(spa::sys::SPA_VIDEO_TRANSFER_SMPTE2084))),
+            Property::new(FormatProperties::VideoColorPrimaries.as_raw(),Value::Id(Id(spa::sys::SPA_VIDEO_COLOR_PRIMARIES_BT2020))),
+        ]);
+    }
+    serialize(object)
 }
 
 fn buffers_param() -> Vec<u8> {
@@ -112,10 +122,29 @@ fn buffers_param() -> Vec<u8> {
     })
 }
 
+fn cursor_param() -> Vec<u8> {
+    serialize(Object { type_: SpaTypes::ObjectParamMeta.as_raw(), id: spa::param::ParamType::Meta.as_raw(), properties: vec![
+        Property::new(spa::sys::SPA_PARAM_META_type, Value::Id(Id(spa::sys::SPA_META_Cursor))),
+        Property::new(spa::sys::SPA_PARAM_META_size,Value::Int(28+20+256*256*4)),
+    ] })
+}
+
+fn header_param() -> Vec<u8> {
+    serialize(Object {
+        type_: SpaTypes::ObjectParamMeta.as_raw(),
+        id: spa::param::ParamType::Meta.as_raw(),
+        properties: vec![
+            Property::new(spa::sys::SPA_PARAM_META_type, Value::Id(Id(spa::sys::SPA_META_Header))),
+            Property::new(spa::sys::SPA_PARAM_META_size, Value::Int(std::mem::size_of::<spa::sys::spa_meta_header>() as i32)),
+        ],
+    })
+}
+
 struct UserData<F> {
     on_event: F,
     desc: DmabufDesc,
     warned_shm: bool,
+    logged_timestamp: Option<bool>,
 }
 
 /// Runs the PipeWire loop on the current thread until `Control::Stop` is received
@@ -125,6 +154,7 @@ pub fn run<F>(
     formats: &[(u32, Vec<u64>)],
     size: (u32, u32),
     max_fps: u32,
+    hdr: bool,
     ctl: pw::channel::Receiver<Control>,
     on_event: F,
 ) -> Result<()>
@@ -155,6 +185,7 @@ where
         on_event,
         desc: DmabufDesc { width: size.0, height: size.1, drm_format: 0, modifier: 0, planes: vec![] },
         warned_shm: false,
+        logged_timestamp: None,
     };
     let ml_err = mainloop.clone();
     let _listener = stream
@@ -197,9 +228,14 @@ where
                 height: ud.desc.height,
                 drm_format: drm,
                 modifier: ud.desc.modifier,
+                hdr: matches!(info.format(),VideoFormat::xRGB_210LE|VideoFormat::xBGR_210LE)
+                    && info.transfer_function()==spa::sys::SPA_VIDEO_TRANSFER_SMPTE2084
+                    && info.color_primaries()==spa::sys::SPA_VIDEO_COLOR_PRIMARIES_BT2020,
             });
             let b = buffers_param();
-            let mut params = [Pod::from_bytes(&b).unwrap()];
+            let h = header_param();
+            let cursor = cursor_param();
+            let mut params = [Pod::from_bytes(&b).unwrap(), Pod::from_bytes(&h).unwrap(), Pod::from_bytes(&cursor).unwrap()];
             if let Err(e) = stream.update_params(&mut params) {
                 tracing::error!("update_params: {e}");
             }
@@ -224,6 +260,16 @@ where
                 return;
             }
             let sbuf = (*newest).buffer;
+            let metas = if (*sbuf).metas.is_null() { &[][..] }
+                else { std::slice::from_raw_parts((*sbuf).metas, (*sbuf).n_metas as usize) };
+            for meta in metas {
+                if meta.type_==spa::sys::SPA_META_Cursor && !meta.data.is_null() {
+                    let bytes=std::slice::from_raw_parts(meta.data as *const u8,meta.size as usize);
+                    if let Some(cursor)=super::cursor::parse(bytes,VideoFormat::BGRA.as_raw(),VideoFormat::RGBA.as_raw()) {
+                        (ud.on_event)(Event::Cursor(cursor));
+                    }
+                }
+            }
             let n = (*sbuf).n_datas as usize;
             let datas = std::slice::from_raw_parts((*sbuf).datas, n);
             if n == 0 || datas[0].type_ != spa::sys::SPA_DATA_DmaBuf {
@@ -244,18 +290,36 @@ where
                 let c = &*d.chunk;
                 ud.desc.planes.push(DmabufPlane { fd: d.fd as i32, offset: c.offset, stride: c.stride as u32 });
             }
-            let pts_ns = stream.time().map(|t| t.now()).unwrap_or(0);
+            let mut pts_ns = 0;
+            let metas = if (*sbuf).metas.is_null() { &[][..] }
+                else { std::slice::from_raw_parts((*sbuf).metas, (*sbuf).n_metas as usize) };
+            for meta in metas {
+                if meta.type_ == spa::sys::SPA_META_Header && !meta.data.is_null()
+                    && meta.size as usize >= std::mem::size_of::<spa::sys::spa_meta_header>() {
+                    let header = &*(meta.data as *const spa::sys::spa_meta_header);
+                    if header.pts > 0 { pts_ns = header.pts; }
+                }
+            }
+            let from_header = pts_ns > 0;
+            // pw_stream_get_time().now can stay at the graph's old driver tick for
+            // video sources. It is not the timestamp of the dequeued buffer.
+            if !from_header { pts_ns = streetlight_proto::now_us() as i64 * 1000; }
+            if ud.logged_timestamp != Some(from_header) {
+                tracing::info!("capture timestamp: {}", if from_header { "spa_meta_header.pts" } else { "receive time approximation (source supplied no header)" });
+                ud.logged_timestamp = Some(from_header);
+            }
             (ud.on_event)(Event::Frame(Frame { desc: &ud.desc, buffer_key: sbuf as usize, pts_ns }));
             stream.queue_raw_buffer(newest);
         })
         .register()?;
 
-    let pods: Vec<Vec<u8>> = [VideoFormat::BGRx, VideoFormat::BGRA, VideoFormat::RGBx, VideoFormat::RGBA]
-        .into_iter()
+    let preferred = if hdr {vec![VideoFormat::xRGB_210LE,VideoFormat::xBGR_210LE]}
+        else {vec![VideoFormat::BGRx,VideoFormat::BGRA,VideoFormat::RGBx,VideoFormat::RGBA]};
+    let pods: Vec<Vec<u8>> = preferred.into_iter()
         .filter_map(|f| {
             let drm = spa_to_drm(f)?;
             let mods = &formats.iter().find(|(d, _)| *d == drm)?.1;
-            Some(enum_format(f, mods, size, max_fps))
+            Some(enum_format(f, mods, size, max_fps, hdr))
         })
         .collect();
     let mut params: Vec<&Pod> = pods.iter().map(|p| Pod::from_bytes(p).unwrap()).collect();

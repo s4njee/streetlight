@@ -1,7 +1,9 @@
 //! QUIC control server: pairing, session lifecycle, input and feedback.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use streetlight_proto::control::{self, AppInfo, ClientMsg, Codec, ColorSpace, Feedback, HostMsg, InputEvent, StreamInfo, StreamRequest};
@@ -15,32 +17,41 @@ use crate::config::{PairedClient, Settings, Trust};
 use crate::encode::EncoderConfig;
 use crate::media::{MediaMsg, MediaServer, SessionKeys};
 use crate::video::{VideoConfig, VideoPipeline};
-use crate::{audio, input};
+use crate::{adaptive, audio, input};
 
 pub struct PendingPair {
     pub client_name: String,
     pub fingerprint: String,
     pin_tx: Option<oneshot::Sender<String>>,
+    owner: u64,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Status {
     pub streaming: bool,
     pub client: Option<String>,
+    /// Exact virtual-output name (without KWin’s Virtual- prefix), for diagnostics.
+    pub output_name: Option<String>,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
     pub codec: Option<String>,
     pub bitrate_kbps: u32,
     pub last_feedback: Option<FeedbackView>,
+    pub app_id: Option<String>,
+    pub app_pid: Option<u32>,
+    pub app_running: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct FeedbackView {
+    pub last_frame: u32,
+    pub idr_requests: u32,
     pub frames_lost: u32,
     pub frames_recovered: u32,
     pub decode_us_avg: u32,
     pub present_us_avg: u32,
+    pub rtt_us: u32,
 }
 
 pub struct AppState {
@@ -51,26 +62,39 @@ pub struct AppState {
     pub status: Mutex<Status>,
     pub media: MediaServer,
     session: Mutex<Option<Session>>,
+    session_gate: Mutex<()>,
+    pair_attempts: Mutex<HashMap<IpAddr, Instant>>,
     session_owner: Mutex<u64>,
     pub status_tx: watch::Sender<u64>,
     pub output_target: input::SharedTarget,
 }
 
 struct Session {
+    app: Option<crate::app::RunningApp>,
     video: VideoPipeline,
     _audio: Option<audio::AudioCapture>,
+    adaptive: adaptive::Controller,
+    adapt_enabled: bool,
+    cursor_metadata: bool,
+    cursor_epoch: u64,
 }
 
 impl AppState {
     pub fn new(identity: Identity, settings: Settings, media: MediaServer) -> Arc<Self> {
+        Self::with_trust(identity, settings, media, Trust::load())
+    }
+
+    fn with_trust(identity: Identity, settings: Settings, media: MediaServer, trust: Trust) -> Arc<Self> {
         Arc::new(Self {
             identity,
             settings: Mutex::new(settings),
-            trust: Mutex::new(Trust::load()),
+            trust: Mutex::new(trust),
             pending: Mutex::new(None),
             status: Mutex::new(Status::default()),
             media,
             session: Mutex::new(None),
+            session_gate: Mutex::new(()),
+            pair_attempts: Mutex::new(HashMap::new()),
             session_owner: Mutex::new(0),
             status_tx: watch::channel(0).0,
             output_target: Default::default(),
@@ -91,6 +115,11 @@ impl AppState {
     }
 
     fn stop_session(&self, owner: Option<u64>) {
+        let _gate = self.session_gate.lock().unwrap();
+        self.stop_session_locked(owner);
+    }
+
+    fn stop_session_locked(&self, owner: Option<u64>) {
         let mut o = self.session_owner.lock().unwrap();
         if owner.is_some_and(|id| id != *o) {
             return;
@@ -153,8 +182,9 @@ async fn handle(state: Arc<AppState>, conn: quinn::Connection, conn_id: u64) -> 
     loop {
         if paired && !aux_started {
             aux_started = true;
-            tokio::spawn(input_task(conn.clone(), state.output_target.clone()));
-            tokio::spawn(feedback_task(conn.clone(), state.clone()));
+            tokio::spawn(input_task(conn.clone(), state.clone(), conn_id));
+            tokio::spawn(feedback_task(conn.clone(), state.clone(), conn_id));
+            tokio::spawn(cursor_task(conn.clone(),state.clone(),conn_id));
         }
         let Some(msg) = net::recv_msg::<ClientMsg>(&mut rx).await? else { return Ok(()) };
         match msg {
@@ -162,7 +192,7 @@ async fn handle(state: Arc<AppState>, conn: quinn::Connection, conn_id: u64) -> 
                 net::send_msg(&mut tx, &HostMsg::Pong { client_us, host_us: streetlight_proto::now_us() }).await?;
             }
             ClientMsg::PairStart { client_name, spake } if !paired => {
-                paired = pair_flow(&state, &mut tx, &mut rx, client_name, spake, &fp, &fp_hex).await?;
+                paired = pair_flow(&state, &conn, &mut tx, &mut rx, PairRequest { owner: conn_id, client_name, spake, fingerprint: &fp, fingerprint_hex: &fp_hex }).await?;
             }
             _ if !paired => {
                 net::send_msg(&mut tx, &HostMsg::Error("not paired".into())).await?;
@@ -174,7 +204,9 @@ async fn handle(state: Arc<AppState>, conn: quinn::Connection, conn_id: u64) -> 
             ClientMsg::Start(req) => {
                 let st = state.clone();
                 let client = name.clone();
-                let r = tokio::task::spawn_blocking(move || start_session(&st, req, conn_id, client)).await?;
+                let fingerprint = fp_hex.clone();
+                let caps = caps.clone();
+                let r = tokio::task::spawn_blocking(move || start_session(&st, req, conn_id, client, &fingerprint, &caps)).await?;
                 match r {
                     Ok(info) => net::send_msg(&mut tx, &HostMsg::StreamStarted(info)).await?,
                     Err(e) => {
@@ -189,34 +221,84 @@ async fn handle(state: Arc<AppState>, conn: quinn::Connection, conn_id: u64) -> 
                 net::send_msg(&mut tx, &HostMsg::StreamStopped { reason: "client request".into() }).await?;
             }
             ClientMsg::RequestIdr => {
+                let owner = state.session_owner.lock().unwrap();
+                if *owner != conn_id { continue; }
                 if let Some(s) = state.session.lock().unwrap().as_ref() {
+                    state.media.record_idr_request();
                     s.video.request_idr();
                 }
             }
-            ClientMsg::SetBitrate { kbps } => tracing::info!("bitrate change to {kbps} kbps requested (restart required for now)"),
+            ClientMsg::SetBitrate { kbps } => {
+                let owner = state.session_owner.lock().unwrap();
+                if *owner == conn_id && let Some(s) = state.session.lock().unwrap().as_mut() {
+                    let target = s.adaptive.set(kbps, Instant::now());
+                    s.video.set_bitrate(target);
+                }
+            },
             ClientMsg::Hello { .. } | ClientMsg::PairStart { .. } | ClientMsg::PairConfirm { .. } => {}
         }
     }
 }
 
+fn reserve_pair(
+    pending: &mut Option<PendingPair>, recent: &mut HashMap<IpAddr, Instant>, now: Instant,
+    ip: IpAddr, owner: u64, client_name: String, fingerprint: String,
+) -> Result<oneshot::Receiver<String>, &'static str> {
+    if pending.is_some() { return Err("pairing in progress"); }
+    recent.retain(|_, last| now.saturating_duration_since(*last) < Duration::from_secs(5));
+    if recent.contains_key(&ip) { return Err("pairing rate limited; retry in 5 seconds"); }
+    recent.insert(ip, now);
+    let (pin_tx, pin_rx) = oneshot::channel();
+    *pending = Some(PendingPair { client_name, fingerprint, pin_tx: Some(pin_tx), owner });
+    Ok(pin_rx)
+}
+
+struct PendingGuard<'a> { state: &'a AppState, owner: u64 }
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        let mut pending = self.state.pending.lock().unwrap();
+        if pending.as_ref().is_some_and(|p| p.owner == self.owner) {
+            *pending = None;
+            self.state.notify();
+        }
+    }
+}
+
+struct PairRequest<'a> {
+    owner: u64,
+    client_name: String,
+    spake: Vec<u8>,
+    fingerprint: &'a [u8; 32],
+    fingerprint_hex: &'a str,
+}
+
 async fn pair_flow(
     state: &AppState,
+    conn: &quinn::Connection,
     tx: &mut quinn::SendStream,
     rx: &mut quinn::RecvStream,
-    client_name: String,
-    spake_a: Vec<u8>,
-    fp: &[u8; 32],
-    fp_hex: &str,
+    request: PairRequest<'_>,
 ) -> Result<bool> {
-    let (pin_tx, pin_rx) = oneshot::channel();
-    *state.pending.lock().unwrap() = Some(PendingPair { client_name: client_name.clone(), fingerprint: fp_hex.into(), pin_tx: Some(pin_tx) });
+    let PairRequest { owner, client_name, spake: spake_a, fingerprint: fp, fingerprint_hex: fp_hex } = request;
+    let reservation = {
+        let mut pending = state.pending.lock().unwrap();
+        let mut recent = state.pair_attempts.lock().unwrap();
+        reserve_pair(&mut pending, &mut recent, Instant::now(), conn.remote_address().ip().to_canonical(),
+            owner, client_name.clone(), fp_hex.into())
+    };
+    let pin_rx = match reservation {
+        Ok(rx) => rx,
+        Err(reason) => { net::send_msg(tx, &HostMsg::Error(reason.into())).await?; return Ok(false); }
+    };
+    let _pending_guard = PendingGuard { state, owner };
     state.notify();
     tracing::warn!("pairing request from '{client_name}': enter the PIN shown on the client at http://127.0.0.1:{}/ or run `streetlight-host pair <PIN>`", control::WEB_PORT);
     net::send_msg(tx, &HostMsg::PairAwaitingPin).await?;
 
-    let pin = tokio::time::timeout(Duration::from_secs(300), pin_rx).await;
-    *state.pending.lock().unwrap() = None;
-    state.notify();
+    let pin = tokio::select! {
+        pin = tokio::time::timeout(Duration::from_secs(300), pin_rx) => pin,
+        _ = conn.closed() => return Ok(false),
+    };
     let Ok(Ok(pin)) = pin else {
         net::send_msg(tx, &HostMsg::PairResult { ok: false, mac: vec![] }).await?;
         return Ok(false);
@@ -224,7 +306,7 @@ async fn pair_flow(
     let (side, spake_b) = PairSide::host(&pin);
     net::send_msg(tx, &HostMsg::PairSpake { spake: spake_b }).await?;
     let key = side.finish(&spake_a);
-    let Some(ClientMsg::PairConfirm { mac }) = net::recv_msg(rx).await? else { bail!("expected PairConfirm") };
+    let Some(ClientMsg::PairConfirm { mac }) = tokio::time::timeout(Duration::from_secs(10), net::recv_msg(rx)).await.context("pair confirmation timed out")?? else { bail!("expected PairConfirm") };
     let host_fp = state.identity.fingerprint();
     let ok = key.as_ref().is_some_and(|k| k.verify(pair::CLIENT_ID, fp, &host_fp, &mac));
     let host_mac = match (&key, ok) {
@@ -248,16 +330,33 @@ async fn pair_flow(
     Ok(ok)
 }
 
-fn start_session(state: &AppState, req: StreamRequest, owner: u64, client: String) -> Result<StreamInfo> {
-    state.stop_session(None);
+fn negotiate_codec(requested: Codec, client: &[Codec], host: &[Codec]) -> Result<Codec> {
+    let candidates = if requested == Codec::Auto { vec![Codec::Av1, Codec::Hevc, Codec::H264] } else { vec![requested] };
+    candidates.into_iter().find(|codec| client.contains(codec) && host.contains(codec))
+        .context("no shared hardware codec (requested codec must be supported by both peers)")
+}
+
+fn start_session(state: &AppState, req: StreamRequest, owner: u64, client: String, fingerprint: &str, caps: &control::ClientCaps) -> Result<StreamInfo> {
+    let _gate = state.session_gate.lock().unwrap();
+    let active_owner = *state.session_owner.lock().unwrap();
+    anyhow::ensure!(active_owner == 0 || active_owner == owner, "host busy");
     let settings = state.settings.lock().unwrap().clone();
+    let mut req = req;
+    anyhow::ensure!(req.color != ColorSpace::Hdr10 || caps.hdr, "client does not support HDR");
+    if req.color==ColorSpace::Hdr10 {
+        settings.hdr_metadata.as_ref().context("HDR requires configured mastering metadata")?.validate()?;
+    }
+    let supported = crate::encode::Encoder::supported_codecs(&settings.render_node, req.color == ColorSpace::Hdr10)?;
+    req.codec = negotiate_codec(req.codec, &caps.codecs, &supported)?;
+    anyhow::ensure!(req.app.as_ref().is_none_or(|id| settings.apps.iter().any(|a| &a.id == id)), "unknown app");
     let d = &req.display;
     anyhow::ensure!(d.width >= 64 && d.height >= 64 && d.width <= 8192 && d.height <= 8192, "bad size");
     let (w, h) = (d.width & !1, d.height & !1);
     let fps = d.fps.clamp(1, 240);
-    let bitrate = req.bitrate_kbps.clamp(1000, settings.max_bitrate_kbps);
+    let bitrate = req.bitrate_kbps.clamp(1000, settings.max_bitrate_kbps.max(1000));
     let ten_bit = req.color == ColorSpace::Hdr10;
 
+    state.stop_session_locked(Some(owner));
     let key = streetlight_proto::crypto::MediaCipher::random_key();
     let mut token = [0u8; 16];
     rand::fill(&mut token);
@@ -267,9 +366,14 @@ fn start_session(state: &AppState, req: StreamRequest, owner: u64, client: Strin
         min_parity: if req.fec_percent > 0 { 2 } else { 0 },
     };
     state.media.begin(SessionKeys { key, token, fec, pace_mbps: req.pace_mbps });
+    struct StartupMedia<'a>(&'a MediaServer,bool);
+    impl Drop for StartupMedia<'_> {fn drop(&mut self){if !self.1 {self.0.end();}}}
+    let mut startup_media=StartupMedia(&state.media,false);
 
     let scale = if d.scale > 0.5 { d.scale as f64 } else { 1.0 };
-    let vname = format!("streetlight-{}", client.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>());
+    let display_name: String = client.chars().filter(|c| c.is_ascii_alphanumeric()).take(40).collect();
+    let display_name = if display_name.is_empty() { "client" } else { &display_name };
+    let vname = format!("streetlight-{}-{display_name}", &fingerprint[..12]);
     let kwin_output = if d.virtual_display { format!("Virtual-{vname}") } else { String::new() };
     let source = if d.virtual_display {
         Source::Virtual {
@@ -281,9 +385,10 @@ fn start_session(state: &AppState, req: StreamRequest, owner: u64, client: Strin
     } else {
         Source::Output { name: None }
     };
+    let cursor_metadata = settings.embed_cursor && caps.cursor_metadata;
     let cfg = VideoConfig {
         source,
-        cursor: if settings.embed_cursor { CursorMode::Embedded } else { CursorMode::Hidden },
+        cursor: if cursor_metadata { CursorMode::Metadata } else if settings.embed_cursor { CursorMode::Embedded } else { CursorMode::Hidden },
         encoder: EncoderConfig {
             codec: req.codec,
             width: w,
@@ -291,6 +396,8 @@ fn start_session(state: &AppState, req: StreamRequest, owner: u64, client: Strin
             fps,
             bitrate_kbps: bitrate,
             ten_bit,
+            hdr_metadata: if ten_bit {settings.hdr_metadata.clone()} else {None},
+            color: req.color,
             render_node: settings.render_node.clone(),
             rc_mode: settings.rc_mode.clone(),
         },
@@ -299,7 +406,7 @@ fn start_session(state: &AppState, req: StreamRequest, owner: u64, client: Strin
     let media = state.media.clone();
     let idr = cfg.force_idr.clone();
     let video = VideoPipeline::start(cfg, move |f| {
-        let ok = media.send(MediaMsg::Video { data: f.data, keyframe: f.keyframe, capture_us: (f.encoded_us - f.encode_us as u64) as u32 });
+        let ok = media.send(MediaMsg::Video { data: f.data, keyframe: f.keyframe, capture_us: f.capture_us as u32 });
         if !ok {
             // The client can't see this gap, so restart the reference chain ourselves.
             tracing::debug!("media queue full, dropped frame; forcing IDR");
@@ -318,12 +425,13 @@ fn start_session(state: &AppState, req: StreamRequest, owner: u64, client: Strin
         }
     };
 
-    if let Some(app) = req.app.as_ref().and_then(|id| settings.apps.iter().find(|a| &a.id == id)) {
-        if let Some(cmd) = &app.command {
-            tracing::info!("launching {}: {cmd}", app.name);
-            let _ = std::process::Command::new("sh").arg("-c").arg(cmd).spawn();
-        }
-    }
+    let app = req.app.as_ref().and_then(|id| settings.apps.iter().find(|a| &a.id == id));
+    let app = match app {
+        Some(app) => crate::app::RunningApp::launch(app, &kwin_output, w, h)?,
+        None => None,
+    };
+    let app_id = app.as_ref().map(|a| a.id.clone());
+    let app_pid = app.as_ref().map(|a| a.pid);
 
     // Absolute input needs the new output's place in the desktop layout; it appears asynchronously.
     {
@@ -344,18 +452,21 @@ fn start_session(state: &AppState, req: StreamRequest, owner: u64, client: Strin
             }
         });
     }
-    *state.session.lock().unwrap() = Some(Session { video, _audio: audio });
+    *state.session.lock().unwrap() = Some(Session { app, video, _audio: audio, adaptive: adaptive::Controller::new(bitrate, Instant::now()), adapt_enabled: settings.adaptive_bitrate, cursor_metadata, cursor_epoch:u64::from_le_bytes(token[..8].try_into().unwrap()) });
     *state.session_owner.lock().unwrap() = owner;
     *state.status.lock().unwrap() = Status {
         streaming: true,
         client: Some(client),
+        output_name: d.virtual_display.then_some(vname),
         width: w,
         height: h,
         fps,
         codec: Some(format!("{:?}", req.codec)),
         bitrate_kbps: bitrate,
         last_feedback: None,
+        app_running: app_pid.is_some(), app_id, app_pid,
     };
+    startup_media.1=true;
     state.notify();
     tracing::info!("streaming {w}x{h}@{fps} {:?} {} kbps", req.codec, bitrate);
     Ok(StreamInfo {
@@ -367,40 +478,96 @@ fn start_session(state: &AppState, req: StreamRequest, owner: u64, client: Strin
         media_port: state.media.port,
         key,
         token,
+        cursor_metadata,
         audio_channels: audio::CHANNELS as u8,
         audio_sample_rate: audio::SAMPLE_RATE,
     })
 }
 
-async fn input_task(conn: quinn::Connection, target: input::SharedTarget) {
-    let injector = match input::Injector::new(target) {
-        Ok(i) => Arc::new(Mutex::new(i)),
-        Err(e) => {
-            tracing::error!("input disabled: {e:#}");
-            return;
-        }
-    };
-    while let Ok(mut rx) = conn.accept_uni().await {
-        let inj = injector.clone();
-        tokio::spawn(async move {
-            while let Ok(Some(ev)) = net::recv_msg::<InputEvent>(&mut rx).await {
-                if let Err(e) = inj.lock().unwrap().inject(&ev) {
-                    tracing::debug!("inject {ev:?}: {e}");
-                }
+async fn input_task(conn: quinn::Connection, state: Arc<AppState>, owner: u64) {
+    let injector: Arc<Mutex<Option<input::Injector>>> = Arc::new(Mutex::new(None));
+    let mut changes = state.status_tx.subscribe();
+    loop {
+        tokio::select! {
+            _ = changes.changed() => {
+                if *state.session_owner.lock().unwrap() != owner { injector.lock().unwrap().take(); }
             }
-        });
+            stream = conn.accept_uni() => {
+                let Ok(mut rx) = stream else { return };
+                let (inj, state) = (injector.clone(), state.clone());
+                tokio::spawn(async move {
+                    while let Ok(Some(ev)) = net::recv_msg::<InputEvent>(&mut rx).await {
+                        let current = state.session_owner.lock().unwrap();
+                        let mut inj = inj.lock().unwrap();
+                        if *current != owner { inj.take(); continue; }
+                        if inj.is_none() {
+                            match input::Injector::new(state.output_target.clone()) {
+                                Ok(i) => *inj = Some(i),
+                                Err(e) => { tracing::error!("input disabled: {e:#}"); return; }
+                            }
+                        }
+                        if let Err(e) = inj.as_mut().unwrap().inject(&ev) { tracing::debug!("inject {ev:?}: {e}"); }
+                    }
+                });
+            }
+        }
     }
 }
 
-async fn feedback_task(conn: quinn::Connection, state: Arc<AppState>) {
+async fn cursor_task(conn:quinn::Connection,state:Arc<AppState>,owner:u64) {
+    let mut tick=tokio::time::interval(Duration::from_millis(4));
+    let mut stream=None;let mut previous=None;let mut shape=None;let mut last_epoch=0;let mut last_sent=Instant::now();
+    loop {
+        tokio::select! {_=conn.closed()=>return,_=tick.tick()=>{}}
+        let (mut snapshot,epoch)={
+            let current=state.session_owner.lock().unwrap();
+            let session=state.session.lock().unwrap();
+            if *current!=owner {previous=None;shape=None;continue;}
+            let Some(session)=session.as_ref() else {continue};
+            if !session.cursor_metadata {continue;}
+            (session.video.cursor.lock().unwrap().clone(),session.cursor_epoch)
+        };
+        if epoch!=last_epoch {previous=None;shape=None;last_epoch=epoch;}
+        snapshot.position.epoch=epoch;
+        if let Some(bitmap)=snapshot.bitmap.as_ref() && shape!=Some(bitmap.id) {
+            if stream.is_none() { match conn.open_uni().await {Ok(s)=>stream=Some(s),Err(_)=>return} }
+            let mut bitmap=bitmap.as_ref().clone();bitmap.epoch=epoch;
+            if net::send_msg(stream.as_mut().unwrap(),&bitmap).await.is_err(){return;}
+            shape=Some(bitmap.id);
+        }
+        if previous!=Some(snapshot.position.serial) || last_sent.elapsed()>=Duration::from_millis(250) {
+            let datagram=streetlight_proto::cursor::Datagram::Cursor(snapshot.position.clone());
+            let bytes=control::encode(&datagram);
+            if conn.send_datagram(bytes[4..].to_vec().into()).is_ok() {
+                previous=Some(snapshot.position.serial);last_sent=Instant::now();
+            }
+        }
+    }
+}
+
+async fn feedback_task(conn: quinn::Connection, state: Arc<AppState>, owner: u64) {
     while let Ok(d) = conn.read_datagram().await {
         if let Ok(fb) = control::decode::<Feedback>(&d) {
+            let current = state.session_owner.lock().unwrap();
+            if *current != owner { continue; }
+            let mut session = state.session.lock().unwrap();
+            if let Some(session) = session.as_mut() {
+                state.status.lock().unwrap().app_running = session.app.as_mut().is_some_and(|a| a.running());
+                if session.adapt_enabled && let Some(kbps) = session.adaptive.observe(fb.clone(), Instant::now()) {
+                    tracing::info!("adaptive bitrate target: {kbps} kbps");
+                    session.video.set_bitrate(kbps);
+                }
+                state.status.lock().unwrap().bitrate_kbps = session.video.bitrate.load(std::sync::atomic::Ordering::Relaxed);
+            }
             let mut s = state.status.lock().unwrap();
             s.last_feedback = Some(FeedbackView {
+                last_frame: fb.last_frame,
+                idr_requests: fb.idr_requests,
                 frames_lost: fb.frames_lost,
                 frames_recovered: fb.frames_recovered,
                 decode_us_avg: fb.decode_us_avg,
                 present_us_avg: fb.present_us_avg,
+                rtt_us: fb.rtt_us,
             });
         }
     }
@@ -412,5 +579,95 @@ fn _codec_names(c: Codec) -> &'static str {
         Codec::H264 => "H.264",
         Codec::Hevc => "HEVC",
         Codec::Av1 => "AV1",
+        Codec::Auto => "Auto",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn identity() -> Identity {
+        let cert = rcgen::generate_simple_self_signed(vec!["streetlight".into()]).unwrap();
+        Identity { cert: cert.cert.der().clone(), key: cert.signing_key.serialize_der().into() }
+    }
+
+    async fn connect(state: Arc<AppState>, id: u64, trusted: bool) -> (quinn::Endpoint, quinn::Endpoint, quinn::Connection, quinn::SendStream, quinn::RecvStream) {
+        let client_id = identity();
+        if trusted {
+            state.trust.lock().unwrap().clients.push(PairedClient { name: "test".into(), fingerprint: pair::fingerprint_hex(&client_id.fingerprint()), paired_at: 0 });
+        }
+        let server = quinn::Endpoint::server(net::server_config(&state.identity).unwrap(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(net::client_config(&client_id).unwrap());
+        let ep = server.clone();
+        tokio::spawn(async move {
+            let conn = ep.accept().await.unwrap().await.unwrap();
+            let _ = handle(state, conn, id).await;
+        });
+        let conn = client.connect(server.local_addr().unwrap(), "streetlight").unwrap().await.unwrap();
+        let (mut tx, mut rx) = conn.open_bi().await.unwrap();
+        net::send_msg(&mut tx, &ClientMsg::Hello { name: "test".into(), caps: streetlight_proto::control::ClientCaps {
+            codecs: vec![Codec::Hevc], hdr: false, max_width: 1920, max_height: 1080, max_fps: 60, cursor_metadata: false, audio_channels: 2,
+        }}).await.unwrap();
+        assert!(matches!(net::recv_msg::<HostMsg>(&mut rx).await.unwrap(), Some(HostMsg::Welcome { paired, .. }) if paired == trusted));
+        (server, client, conn, tx, rx)
+    }
+
+    #[test]
+    fn codec_selection_respects_both_peers_and_explicit_preferences() {
+        assert_eq!(negotiate_codec(Codec::Auto, &[Codec::Hevc], &[Codec::Av1,Codec::Hevc]).unwrap(),Codec::Hevc);
+        assert_eq!(negotiate_codec(Codec::Auto, &[Codec::Av1,Codec::Hevc], &[Codec::Av1,Codec::Hevc]).unwrap(),Codec::Av1);
+        assert!(negotiate_codec(Codec::Av1, &[Codec::Hevc], &[Codec::Av1,Codec::Hevc]).is_err());
+        assert!(negotiate_codec(Codec::Auto, &[Codec::Hevc], &[Codec::H264]).is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_pairing_rejection_disconnect_cleanup_and_ip_limit_over_quic() {
+        let state = AppState::with_trust(identity(), Settings::default(), MediaServer::bind(0).unwrap(), Trust::default());
+        let (_s1, _e1, c1, mut tx1, mut rx1) = connect(state.clone(), 1, false).await;
+        let (_s2, _e2, c2, mut tx2, mut rx2) = connect(state.clone(), 2, false).await;
+        let message = ClientMsg::PairStart { client_name: "pair-test".into(), spake: vec![] };
+        net::send_msg(&mut tx1, &message).await.unwrap();
+        assert!(matches!(net::recv_msg::<HostMsg>(&mut rx1).await.unwrap(), Some(HostMsg::PairAwaitingPin)));
+        net::send_msg(&mut tx2, &message).await.unwrap();
+        assert!(matches!(net::recv_msg::<HostMsg>(&mut rx2).await.unwrap(), Some(HostMsg::Error(e)) if e == "pairing in progress"));
+        assert_eq!(state.pending.lock().unwrap().as_ref().unwrap().owner, 1);
+        c1.close(0u32.into(), b"test disconnect");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.pending.lock().unwrap().is_some() { tokio::time::sleep(Duration::from_millis(1)).await; }
+        }).await.unwrap();
+        net::send_msg(&mut tx2, &message).await.unwrap();
+        assert!(matches!(net::recv_msg::<HostMsg>(&mut rx2).await.unwrap(), Some(HostMsg::Error(e)) if e.contains("rate limited")));
+        c2.close(0u32.into(), b"done");
+    }
+
+    #[tokio::test]
+    async fn competing_start_is_refused_before_touching_capture_or_existing_owner() {
+        let state = AppState::with_trust(identity(), Settings::default(), MediaServer::bind(0).unwrap(), Trust::default());
+        *state.session_owner.lock().unwrap() = 99;
+        let (_s, _e, conn, mut tx, mut rx) = connect(state.clone(), 2, true).await;
+        let request = StreamRequest { display: streetlight_proto::control::DisplayRequest { width: 1920, height: 1080, fps: 60, scale: 1.0, virtual_display: true },
+            codec: Codec::Hevc, color: ColorSpace::Sdr709, bitrate_kbps: 30_000, fec_percent: 20, max_shard_bytes: 1400, pace_mbps: 0, app: None };
+        net::send_msg(&mut tx, &ClientMsg::Start(request)).await.unwrap();
+        assert!(matches!(net::recv_msg::<HostMsg>(&mut rx).await.unwrap(), Some(HostMsg::Error(e)) if e == "host busy"));
+        assert_eq!(*state.session_owner.lock().unwrap(), 99);
+        conn.close(0u32.into(), b"done");
+    }
+
+    #[test]
+    fn pending_pairing_is_not_overwritten_and_attempts_are_rate_limited() {
+        let mut pending = None;
+        let mut recent = HashMap::new();
+        let ip = "127.0.0.1".parse().unwrap();
+        let now = Instant::now();
+        let mut first = reserve_pair(&mut pending, &mut recent, now, ip, 1, "first".into(), "first-fp".into()).unwrap();
+        assert_eq!(reserve_pair(&mut pending, &mut recent, now, "127.0.0.2".parse().unwrap(), 2, "second".into(), "second-fp".into()).unwrap_err(), "pairing in progress");
+        let original = pending.take().unwrap();
+        assert_eq!(original.owner, 1);
+        original.pin_tx.unwrap().send("1234".into()).unwrap();
+        assert_eq!(first.try_recv().unwrap(), "1234");
+        assert!(reserve_pair(&mut pending, &mut recent, now + Duration::from_secs(1), ip, 3, "retry".into(), "fp".into()).is_err());
+        assert!(pending.is_none());
+        assert!(reserve_pair(&mut pending, &mut recent, now + Duration::from_secs(5), ip, 4, "retry".into(), "fp".into()).is_ok());
     }
 }

@@ -7,6 +7,94 @@ what is verified, what's left, the order to do it in, and how to prove each piec
 Read first: [README.md](README.md) (setup and status) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 (design, wire format, ports). Baseline commit: `fd962b4`.
 
+## P0 checkpoint (2026-11-08; P1 updates below)
+
+- **§2.1 implemented:** Host/Origin middleware, process token in HTML and private runtime
+  file, CLI token support, confirmed/warn-logged app command changes, real HTTP integration tests.
+  Browser-pane rendering and actual CLI pairing verified with scratch config/runtime.
+- **§2.2 implemented and measured on the dev PC:** test-only packet loss/burst/reorder,
+  JSON receiver stats and host IDR/keyframe counters, 2 ms reordering tolerance, Linux Opus PLC,
+  and `scripts/loss-matrix.sh`. All five 15-second cases passed with zero decode errors.
+  2% random: 0 lost / 529 FEC recovered; 10%: 23 lost / ≤15.07 ms recovery;
+  burst: ≤349.98 ms delivery gap; reorder: 0 lost.
+- Release workspace binaries/examples build and 13 tests pass. Plain workspace clippy remains
+  blocked by 20 pre-existing raw-pointer lint errors in unchanged `client-core/src/ffi.rs`;
+  allowing only that lint passes without new warnings.
+- Exact measurements, reproduction, definitions and limitations: [docs/TESTING.md](docs/TESTING.md).
+  Pi/iPad remain unverified; C ABI/iPad audio currently leaves a gap rather than doing PLC.
+  This is the historical P0 checkpoint; current P1 results are below.
+
+## P1 progress (2026-11-09; Pi-focused at user's request)
+
+- **§2.3 implemented and passed:** `scripts/e2e.sh` builds release bins/examples and
+  webview, isolates configuration, verifies video plus focused/heartbeat-gated input,
+  gamepad creation/removal, 440 Hz audio, and the real WebKit UI. It also exposed and
+  fixed graceful session teardown and first-event loss during KWin input discovery.
+- **§2.4 items 1–4 and 6–11 implemented/verified:** concurrent pairing rejection/IP
+  rate limit with real QUIC tests; competing sessions receive `host busy`; owner-only
+  input/feedback; actual frame number/IDR feedback; real GDK presentation timing;
+  fingerprint output names; one-shot pairing listeners; asynchronous/cancellable UI
+  startup; PipeWire header timestamps; removed/documented unsupported Text; explicit
+  audio buffering, backend errors and underrun counters. Item 5's client discovery
+  is verified on Pi, but automatic host multi-GPU selection remains pending.
+- **§2.5 partial:** `--latency` prints bounded p50/p95/p99 samples every five seconds;
+  real Pi timings are in `docs/TESTING.md`. 120/144 Hz delivery/refresh selection and
+  encoder quality/QVBR/VMAF comparisons remain pending.
+- **§3 native bring-up verified:** Rust/webview builds on the 4 GB Trixie Pi; vc4-drm
+  discovery selects card1; HEVC request decode and NV12/SAND128 offload work at
+  1080p60/4K60. Correct legacy color conversion was checked separately from the soak.
+  Packaging is installed on `neo.local` under `~/.local`, with a desktop entry and
+  optional disabled service; the existing kiosk is preserved.
+- **§3 audio/performance:** 30 minutes at 4K60/80 Mbit/s with 107,610 decoded frames,
+  zero lost frames/decode errors/audio underruns/backend errors; CPU mean 9.43% of
+  one core, maximum 51.25°C, no throttling. Decode p95 reaches 10.978 ms: the ≤8 ms
+  target is explicitly **not met**. The soak exposed an NV12 matrix/range mismatch;
+  corrected color negotiation/conversion is validated in separate smoke checks.
+- Physical Pi keyboard/mouse/Xbox/DualSense checks and tone audibility
+  remain pending; the user confirmed the corrected TV picture. Mac/iPad work (§4) is deferred; the Mac was not accessed.
+- Release workspace/webview builds, 18 Rust tests, bridge subscription check and plain
+  workspace clippy pass (existing warnings only). The old P0 FFI lint blockers are fixed.
+  Rebuild both ends for the `streetlight/2` protocol. Exact evidence and remaining
+  checklist: [docs/TESTING.md](docs/TESTING.md), [docs/PI.md](docs/PI.md).
+
+## P2 progress (2026-11-09)
+
+- **§5.1 implemented/verified:** feedback-driven bitrate control, 15% reductions after
+  sustained loss/RTT growth, 5% clean recovery, request ceiling and bounded floor;
+  codec-only reopen retains capture/VPP/imports and starts a fresh reference chain.
+  The scripted changing-loss run measured 30,000 → 15,659 → 18,126 kbit/s with clean
+  decoded output and a single capture instance.
+- **§5.2 Linux implementation verified:** checked SPA cursor bitmap/position parsing,
+  reliable shape transport plus independent QUIC position datagrams, epoch/serial
+  filtering and refresh, GTK overlay with hotspot/letterbox scaling and local motion.
+  Normal selftest received nine positions and a valid bitmap. Pi overlay verification
+  uses a synthetic cursor fixture with no input injection. On Cage/GTK 4.18 it forces
+  RGB composition, so the Pi retains embedded cursors by default (`SL_CLIENT_CURSOR=1`
+  opts in). iPad CALayer work is deferred.
+- **§5.3 manual Linux pointer lock implemented/verified:** GTK-surface Wayland constraints
+  and unaccelerated relative motion, Ctrl+Alt+Shift+M toggle, focus/end/disabled-input
+  release and absolute fallback. The focused virtual probe measured exact +30,+20
+  relative motion and lock/release events. Automatic host-game grab detection remains pending.
+- **§5.4 guarded implementation; acceptance blocked:** 10-bit RGB BT.2020/PQ capture
+  negotiation, explicit P010 conversion, HEVC Main10, configured mastering/content-light
+  SEI and GTK PQ state. The available KWin source rejects the 10-bit input formats.
+  HDR is off by default; unsupported/unverified capture is rejected. Actual Main10/SEI
+  stream output, physical HDR presentation and iPad EDR remain unverified.
+- **§5.5 implemented/verified on Linux:** Auto selects AV1 → HEVC → H.264 from real VA
+  profile/FFmpeg support; explicit unsupported codecs are rejected. Fixed accidental
+  software AV1 selection and added raw-OBU temporal delimiters. AV1 and H.264 hardware
+  decode/dump checks passed; Pi Auto selects HEVC and explicitly rejects AV1 before capture.
+- **§5.6 implemented:** tracked per-app process groups, configurable stop/leave policy,
+  reserved group leader IDs, reaping, status/UI controls and Steam/KWin placement recipe.
+  Process lifecycle tests pass; the user's Steam and KWin rules were not changed.
+- Both ends require **`streetlight/3`**. Full evidence, commands and remaining limits:
+  [docs/P2.md](docs/P2.md), [docs/APPS.md](docs/APPS.md). Release workspace/webview builds,
+  27 Rust tests, bridge subscription tests and plain workspace clippy pass (existing
+  warnings only). Earlier normal and locked-pointer E2E checks passed; a final input
+  rerun safely skipped injection after probe focus changed and failed its strict
+  assertions. Input-free Pi checks retain direct NV12; 4K decode p95 11.152 ms still
+  misses the P1 8 ms target.
+
 ---
 
 ## 0. Ground rules for the implementing agent
@@ -41,12 +129,13 @@ how easily that leaks into the user's session. Follow these rules:
 10. **Commits:** work on a branch, use the repo-local git identity that's already set, and end
     each commit message with the attribution trailer the harness gives you. Don't push without being asked.
 
-### 0.2 Hardware you don't have
+### 0.2 Available hardware
 
-The Pi 5, the iPad and the Mac are physical devices. Tasks in §3 and §4 need the user, or SSH
-access the user provides (ask for the Pi's address and whether you may SSH). Write and
-statically check everything you can. Then give the user an exact checklist to run and the
-output to paste back. Never mark a hardware task done without that evidence.
+The user authorized SSH to the Pi at `neo.local` and asked to work on the Pi for now.
+It is a 4 GB Pi 5, Trixie 13.7, Gigabit Ethernet, Cage/Chromium and a 4K60 TV.
+Preserve its kiosk/startup configuration. The Mac at `192.168.1.251` and iPad work are
+deferred; the Mac has not been accessed. Never mark a hardware task done without evidence.
+The user confirmed the TV picture; tone audibility and USB/controller observations remain outstanding.
 
 ### 0.3 Build and run reference
 
@@ -64,20 +153,22 @@ SL_UI_EVAL='…js…' ./target/release/streetlight-client --windowed --no-input 
 ./target/release/streetlight-host capture-test 5 $S/c.hevc 2560x1440   # capture+encode only
 ```
 
-There's no motion on the virtual display by default. To generate it, play a test pattern on the
-virtual output (its KWin name is `Virtual-streetlight-<client-hostname>`; mpv matches the part
-after `Virtual-`):
+There's no motion on the virtual display by default. Obtain the exact output name
+(fingerprint prefix + client display name) from the running host, then verify the
+`Virtual-` prefixed monitor exists before playing a pattern:
 
 ```bash
-timeout 6 mpv --really-quiet --no-audio --fs --fs-screen-name=streetlight-freya \
-  --screen-name=streetlight-freya "av://lavfi:testsrc2=size=1920x1080:rate=60"
+output=$(python3 -c 'import json,urllib.request; print(json.load(urllib.request.urlopen("http://127.0.0.1:47990/api/status"))["status"]["output_name"])')
+wayland-info | rg "Virtual-$output"  # required before fullscreen playback
+timeout 6 mpv --really-quiet --no-audio --fs --fs-screen-name="$output" \
+  --screen-name="$output" "av://lavfi:testsrc2=size=1920x1080:rate=60"
 ```
 
 Decode check for a dump: `ffmpeg -v error -threads 1 -i out.hevc -f null - 2>&1 | grep -c 'Could not find'` must be `0`.
 
 ---
 
-## 1. Current state (verified at `fd962b4`)
+## 1. Current state (baseline `fd962b4`, updated with P0/P1 evidence)
 
 | Area | State | Evidence |
 |---|---|---|
@@ -85,14 +176,14 @@ Decode check for a dump: `ffmpeg -v error -threads 1 -i out.hevc -f null - 2>&1 
 | VA-API import + VPP (BGRx→NV12 BT.709 limited) + `hevc_vaapi` | ✅ | ~3.4 ms per 1080p frame; VBR default (CBR wasted ~25 % on filler) |
 | Wire: per-frame RS FEC, AES-128-GCM, GSO send (≤64 KiB per send) | ✅ | unit tests; 1440p60 @ 80 Mbit/s, 0 loss, 0 decode errors |
 | QUIC control, SPAKE2 PIN pairing, cert pinning | ✅ | pair via CLI and via web UI |
-| Host web UI (127.0.0.1:47990) | ✅ renders | **but see P0 security issue (§2.1)** |
+| Host web UI (127.0.0.1:47990) | ✅ hardened after baseline | Host/Origin/token checks + command confirmation; HTTP tests and browser-pane rendering |
 | Linux client: VA-API decode → dmabuf → GTK4 `GraphicsOffload` | ✅ on dev PC | ~2 ms decode; no import errors |
 | Linux webview UI (WebKitGTK 6) + bridge | ✅ | discover → connect → apps → stream 2560×1440@144 from the UI |
 | Input: keys, abs + relative mouse, buttons, scroll, touch, gamepad | ✅ | gated self-test + `input_probe`; python-evdev on the virtual pad |
 | Audio: PipeWire monitor → Opus 5 ms → client | ✅ | 440 Hz tone decoded at the expected RMS, continuous |
-| Pi 5 decode path (V4L2-request DRM-PRIME, SAND128) | ❓ written, untested | no hardware |
-| iPad app (Swift, `AVSampleBufferDisplayLayer`, WKWebView, GameController) | ❓ written, never compiled | no Mac |
-| Loss recovery (FEC + IDR on loss) under real loss | ❓ untested | only lossless loopback so far |
+| Pi 5 decode path (V4L2-request DRM-PRIME, SAND128) | ✅ hardware verified | 1080p60/4K60, 30-minute soak; 4K decode p95 misses 8 ms target |
+| iPad app (Swift, `AVSampleBufferDisplayLayer`, WKWebView, GameController) | ❓ written, never compiled | Mac available; work deferred at user request |
+| Loss recovery (FEC + IDR on loss) | ✅ injected UDP loss on dev PC | five-case matrix in `docs/TESTING.md`; physical network/device loss remains unverified |
 | Virtual display refresh > 60 Hz actually delivered | ❓ unknown | 144 fps was negotiated, but delivery wasn't measured |
 
 Key source files: `crates/host/src/{server,video,encode,media,input,capture/*}.rs`,
@@ -261,11 +352,11 @@ Fix each one with a test or a logged verification:
 Ask the user for: the Pi's OS (`cat /etc/os-release`; Trixie is expected), whether it runs a
 desktop (labwc) or Lite, its IP, SSH permission, and whether it's on wired Ethernet.
 
-1. **Build on the Pi** (README has the apt list). Expected blocker: `ffmpeg-sys-next` 9 vs the
-   Pi's FFmpeg (Raspberry Pi's patched 7.x or 8.x). Fix: `ffmpeg-sys-next` versions are tied to
-   FFmpeg majors. Add a cargo feature or `cfg` to choose the major. Alternatively make the client
-   decode module use its own `bindgen` against the system headers, as the host does for libva.
-   Acceptance: `cargo build --release -p streetlight-client --features webview` succeeds on the Pi.
+1. **Build on the Pi** (README has the apt list). Verified native release/webview build
+   against Raspberry Pi's patched FFmpeg 7.1.5 with `ffmpeg-sys-next` 9. The bindings are
+   generated against system headers; the crate major does not require that FFmpeg major.
+   Keep the request-decoder/SAND patches; install CMake/Ninja for bundled Opus and use `-j 1`
+   on the 4 GB Pi. Source and detailed evidence: [docs/PI.md](docs/PI.md).
 2. **Decoder bring-up.** Run `streetlight-client <host> --windowed --no-input` and check the log for
    `decoder: hevc via Drm`. If `avcodec_open2` fails, check `ffmpeg -hwaccels` on the Pi and the
    needed `-hwaccel drm` device (on the Pi 5 the KMS card may be `card1`; see §2.4 item 5).

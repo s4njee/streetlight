@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const ALPN: &[u8] = b"streetlight/1";
+pub const ALPN: &[u8] = b"streetlight/3";
 pub const CONTROL_PORT: u16 = 47800;
 pub const MEDIA_PORT: u16 = 47801;
 pub const WEB_PORT: u16 = 47990;
@@ -13,6 +13,8 @@ pub enum Codec {
     H264,
     Hevc,
     Av1,
+    /// Choose the best hardware codec shared by client and host.
+    Auto,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +23,8 @@ pub enum ColorSpace {
     Sdr709,
     /// BT.2020 PQ, 10-bit.
     Hdr10,
+    /// Legacy unmanaged NV12 presentation (BT.601 matrix, full range, sRGB primaries/TRC).
+    Sdr601Full,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +34,8 @@ pub struct ClientCaps {
     pub max_width: u32,
     pub max_height: u32,
     pub max_fps: u32,
+    #[serde(default)]
+    pub cursor_metadata: bool,
     pub audio_channels: u8,
 }
 
@@ -104,6 +110,8 @@ pub struct StreamInfo {
     pub key: [u8; 16],
     /// Sent back by the client in a Probe packet so the host learns its media address.
     pub token: [u8; 16],
+    #[serde(default)]
+    pub cursor_metadata: bool,
     pub audio_channels: u8,
     pub audio_sample_rate: u32,
 }
@@ -112,10 +120,12 @@ pub struct StreamInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Feedback {
     pub last_frame: u32,
+    pub idr_requests: u32,
     pub frames_lost: u32,
     pub frames_recovered: u32,
     pub decode_us_avg: u32,
     pub present_us_avg: u32,
+    pub rtt_us: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -172,7 +182,6 @@ pub enum InputEvent {
     Touch { id: u8, phase: TouchPhase, x: u16, y: u16 },
     Gamepad(GamepadState),
     GamepadDisconnected { id: u8 },
-    Text(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

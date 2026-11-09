@@ -37,4 +37,3 @@ void sl_input_touch(const SLClient *c, uint8_t id, uint8_t phase, uint16_t x, ui
 void sl_input_gamepad(const SLClient *c, uint8_t id, uint32_t buttons, int16_t lx, int16_t ly, int16_t rx, int16_t ry,
                       uint8_t lt, uint8_t rt);
 void sl_input_gamepad_disconnected(const SLClient *c, uint8_t id);
-void sl_input_text(const SLClient *c, const char *utf8);

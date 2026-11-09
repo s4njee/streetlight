@@ -5,9 +5,12 @@ use std::ptr;
 
 use anyhow::{Result, anyhow, bail};
 use ffmpeg_sys_next as ff;
-use streetlight_proto::control::Codec;
+use streetlight_proto::control::{Codec, ColorSpace};
 
 use crate::gpu::va::{self, OutputColor};
+
+#[allow(non_upper_case_globals,non_camel_case_types,non_snake_case,dead_code,clippy::all)]
+mod hdr_ffi { include!(concat!(env!("OUT_DIR"),"/hdr.rs")); }
 
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
@@ -17,6 +20,8 @@ pub struct EncoderConfig {
     pub fps: u32,
     pub bitrate_kbps: u32,
     pub ten_bit: bool,
+    pub hdr_metadata: Option<crate::hdr::Metadata>,
+    pub color: ColorSpace,
     pub render_node: String,
     /// "CBR" | "VBR" | "QVBR"
     pub rc_mode: String,
@@ -29,7 +34,7 @@ pub struct Encoder {
     ctx: *mut ff::AVCodecContext,
     pkt: *mut ff::AVPacket,
     pub va: va::Display,
-    vpp: va::Vpp,
+    vpp: std::mem::ManuallyDrop<va::Vpp>,
     pts: i64,
 }
 
@@ -70,10 +75,26 @@ impl Encoder {
             (*fc).initial_pool_size = 0;
             ck(ff::av_hwframe_ctx_init(frames), "av_hwframe_ctx_init")?;
 
+            let ctx = match Self::open_codec(&cfg,frames,device) {
+                Ok(ctx)=>ctx,
+                Err(e)=>{let mut frames=frames;ff::av_buffer_unref(&mut frames);ff::av_buffer_unref(&mut device);return Err(e);}
+            };
+
+            let vpp=match va::Vpp::new(va) {
+                Ok(vpp)=>std::mem::ManuallyDrop::new(vpp),
+                Err(e)=>{let mut ctx=ctx;let mut frames=frames;ff::avcodec_free_context(&mut ctx);ff::av_buffer_unref(&mut frames);ff::av_buffer_unref(&mut device);return Err(e);}
+            };
+            Ok(Self { cfg, device, frames, ctx, pkt: ff::av_packet_alloc(), va, vpp, pts: 0 })
+        }
+    }
+
+    unsafe fn open_codec(cfg: &EncoderConfig, frames: *mut ff::AVBufferRef, device: *mut ff::AVBufferRef) -> Result<*mut ff::AVCodecContext> {
+        unsafe {
             let name = match cfg.codec {
                 Codec::Hevc => "hevc_vaapi",
                 Codec::Av1 => "av1_vaapi",
                 Codec::H264 => "h264_vaapi",
+                Codec::Auto => bail!("Auto must be negotiated before opening the encoder"),
             };
             let cname = CString::new(name)?;
             let codec = ff::avcodec_find_encoder_by_name(cname.as_ptr());
@@ -81,13 +102,14 @@ impl Encoder {
                 bail!("encoder {name} not found");
             }
             let ctx = ff::avcodec_alloc_context3(codec);
+            let result = (|| -> Result<()> {
             let c = &mut *ctx;
             c.width = cfg.width as c_int;
             c.height = cfg.height as c_int;
             c.time_base = ff::AVRational { num: 1, den: cfg.fps as c_int };
             c.framerate = ff::AVRational { num: cfg.fps as c_int, den: 1 };
             c.pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
-            c.sw_pix_fmt = (*fc).sw_format;
+            c.sw_pix_fmt = (*( (*frames).data as *mut ff::AVHWFramesContext)).sw_format;
             c.hw_frames_ctx = ff::av_buffer_ref(frames);
             c.hw_device_ctx = ff::av_buffer_ref(device);
             let bps = cfg.bitrate_kbps as i64 * 1000;
@@ -104,17 +126,22 @@ impl Encoder {
                 c.color_primaries = ff::AVColorPrimaries::AVCOL_PRI_BT2020;
                 c.color_trc = ff::AVColorTransferCharacteristic::AVCOL_TRC_SMPTE2084;
                 c.colorspace = ff::AVColorSpace::AVCOL_SPC_BT2020_NCL;
+            } else if cfg.color == ColorSpace::Sdr601Full {
+                c.color_primaries = ff::AVColorPrimaries::AVCOL_PRI_BT709;
+                c.color_trc = ff::AVColorTransferCharacteristic::AVCOL_TRC_IEC61966_2_1;
+                c.colorspace = ff::AVColorSpace::AVCOL_SPC_BT470BG;
             } else {
                 c.color_primaries = ff::AVColorPrimaries::AVCOL_PRI_BT709;
                 c.color_trc = ff::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
                 c.colorspace = ff::AVColorSpace::AVCOL_SPC_BT709;
             }
-            c.color_range = ff::AVColorRange::AVCOL_RANGE_MPEG;
+            c.color_range = if cfg.color == ColorSpace::Sdr601Full { ff::AVColorRange::AVCOL_RANGE_JPEG } else { ff::AVColorRange::AVCOL_RANGE_MPEG };
             c.chroma_sample_location = ff::AVChromaLocation::AVCHROMA_LOC_LEFT;
             match cfg.codec {
                 Codec::Hevc => c.profile = if cfg.ten_bit { 2 } else { 1 }, // Main10 / Main
                 Codec::H264 => c.profile = 100,                             // High
                 Codec::Av1 => c.profile = 0,
+                Codec::Auto => unreachable!(),
             }
 
             let mut dict: *mut ff::AVDictionary = ptr::null_mut();
@@ -123,6 +150,7 @@ impl Encoder {
             opt(&mut dict, "b_depth", "1");
             if cfg.codec == Codec::Hevc {
                 opt(&mut dict, "tier", "main");
+                if cfg.ten_bit { opt(&mut dict,"sei","hdr"); }
             }
             if cfg.codec != Codec::Av1 {
                 opt(&mut dict, "aud", "0");
@@ -131,8 +159,45 @@ impl Encoder {
             ff::av_dict_free(&mut dict);
             ck(r, &format!("avcodec_open2({name})"))?;
 
-            let vpp = va::Vpp::new(va)?;
-            Ok(Self { cfg, device, frames, ctx, pkt: ff::av_packet_alloc(), va, vpp, pts: 0 })
+            Ok(())
+            })();
+            if let Err(e) = result { let mut ctx = ctx; ff::avcodec_free_context(&mut ctx); return Err(e); }
+            Ok(ctx)
+        }
+    }
+
+    /// FFmpeg VA-API initializes rate-control state at codec open. Reopen only
+    /// that context; keep capture, VA display, VPP, pools and imported DMA-BUFs.
+    pub fn set_bitrate(&mut self, kbps: u32) -> Result<()> {
+        if kbps == self.cfg.bitrate_kbps { return Ok(()); }
+        let mut cfg = self.cfg.clone(); cfg.bitrate_kbps = kbps;
+        let ctx = unsafe { Self::open_codec(&cfg, self.frames, self.device)? };
+        unsafe { ff::avcodec_free_context(&mut self.ctx); }
+        self.ctx = ctx; self.cfg = cfg;
+        Ok(())
+    }
+
+    pub fn supported_codecs(render_node: &str, ten_bit: bool) -> Result<Vec<Codec>> {
+        unsafe {
+            let mut device = ptr::null_mut();
+            let node = CString::new(render_node)?;
+            ck(ff::av_hwdevice_ctx_create(&mut device, ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                node.as_ptr(), ptr::null_mut(), 0), "probe VA encoder")?;
+            let hw = (*device).data as *mut ff::AVHWDeviceContext;
+            let va = (*hw).hwctx as *mut ff::AVVAAPIDeviceContext;
+            let display = (*va).display as va::ffi::VADisplay;
+            let mut result = Vec::new();
+            for (codec, profile) in [(Codec::Av1, 32), (Codec::Hevc, if ten_bit { 18 } else { 17 }), (Codec::H264, 7)] {
+                if ten_bit && codec != Codec::Hevc { continue; }
+                let name=match codec {Codec::Av1=>c"av1_vaapi",Codec::Hevc=>c"hevc_vaapi",Codec::H264=>c"h264_vaapi",Codec::Auto=>unreachable!()};
+                if ff::avcodec_find_encoder_by_name(name.as_ptr()).is_null(){continue;}
+                let mut entries = vec![0; va::ffi::vaMaxNumEntrypoints(display).max(0) as usize];
+                let mut count = 0;
+                if va::ffi::vaQueryConfigEntrypoints(display, profile, entries.as_mut_ptr(), &mut count) == 0
+                    && entries.iter().take(count.max(0) as usize).any(|&e| e == 6 || e == 8) { result.push(codec); }
+            }
+            ff::av_buffer_unref(&mut device);
+            Ok(result)
         }
     }
 
@@ -156,7 +221,7 @@ impl Encoder {
             let r = (|| -> Result<()> {
                 ck(ff::av_hwframe_get_buffer(self.frames, frame, 0), "av_hwframe_get_buffer")?;
                 let dst = (*frame).data[3] as usize as va::ffi::VASurfaceID;
-                let color = if self.cfg.ten_bit { OutputColor::Bt2020Limited } else { OutputColor::Bt709Limited };
+                let color = if self.cfg.ten_bit { OutputColor::Bt2020Limited } else if self.cfg.color == ColorSpace::Sdr601Full { OutputColor::Bt601Full } else { OutputColor::Bt709Limited };
                 // No vaSyncSurface here: the encoder orders after the VPP job on the same
                 // display, and the PipeWire buffer is only requeued after encode completes.
                 self.vpp.blit(src, src_size, dst, (self.cfg.width, self.cfg.height), color)?;
@@ -166,6 +231,18 @@ impl Encoder {
             if let Err(e) = r {
                 ff::av_frame_free(&mut frame);
                 return Err(e);
+            }
+            if let Some(metadata)=&self.cfg.hdr_metadata {
+                let md=hdr_ffi::av_mastering_display_metadata_create_side_data(frame.cast());
+                let cl=hdr_ffi::av_content_light_metadata_create_side_data(frame.cast());
+                if md.is_null()||cl.is_null(){ff::av_frame_free(&mut frame);bail!("allocate HDR side data");}
+                let rational=|n:u32,d:i32|hdr_ffi::AVRational{num:n as i32,den:d};
+                for i in 0..3 {for j in 0..2 {(*md).display_primaries[i][j]=rational(metadata.primaries[i][j],50000);}}
+                for j in 0..2 {(*md).white_point[j]=rational(metadata.white_point[j],50000);}
+                (*md).min_luminance=rational(metadata.min_luminance,10000);
+                (*md).max_luminance=rational(metadata.max_luminance,10000);
+                (*md).has_primaries=1;(*md).has_luminance=1;
+                (*cl).MaxCLL=metadata.max_cll;(*cl).MaxFALL=metadata.max_fall;
             }
             (*frame).pts = self.pts;
             self.pts += 1;
@@ -189,7 +266,11 @@ impl Encoder {
                 ck(r, "avcodec_receive_packet")?;
                 let p = &*self.pkt;
                 let data = std::slice::from_raw_parts(p.data, p.size as usize);
-                sink(data, p.flags & ff::AV_PKT_FLAG_KEY != 0);
+                if self.cfg.codec==Codec::Av1 && data.first().is_some_and(|b| (b>>3)&15!=2) {
+                    // Raw low-overhead AV1 needs a temporal delimiter per access unit.
+                    let mut obu=Vec::with_capacity(data.len()+2);obu.extend_from_slice(&[0x12,0]);obu.extend_from_slice(data);
+                    sink(&obu,p.flags & ff::AV_PKT_FLAG_KEY != 0);
+                } else { sink(data, p.flags & ff::AV_PKT_FLAG_KEY != 0); }
                 ff::av_packet_unref(self.pkt);
             }
         }
@@ -199,6 +280,7 @@ impl Encoder {
 impl Drop for Encoder {
     fn drop(&mut self) {
         unsafe {
+            std::mem::ManuallyDrop::drop(&mut self.vpp);
             ff::av_packet_free(&mut self.pkt);
             ff::avcodec_free_context(&mut self.ctx);
             ff::av_buffer_unref(&mut self.frames);
