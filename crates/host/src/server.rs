@@ -71,6 +71,9 @@ pub struct AppState {
 
 struct Session {
     app: Option<crate::app::RunningApp>,
+    /// Moves the app's windows onto the stream's monitor; unloaded with
+    /// the session
+    _placement: Option<crate::placement::Placement>,
     video: VideoPipeline,
     _audio: Option<audio::AudioCapture>,
     adaptive: adaptive::Controller,
@@ -426,6 +429,17 @@ fn start_session(state: &AppState, req: StreamRequest, owner: u64, client: Strin
     };
 
     let app = req.app.as_ref().and_then(|id| settings.apps.iter().find(|a| &a.id == id));
+    // Before the app starts, so its first window is caught
+    let placement = match app {
+        Some(a) if a.command.is_some() && !kwin_output.is_empty() => match crate::placement::Placement::start(&kwin_output) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!("app windows won't follow the stream: {e:#}");
+                None
+            }
+        },
+        _ => None,
+    };
     let app = match app {
         Some(app) => crate::app::RunningApp::launch(app, &kwin_output, w, h)?,
         None => None,
@@ -459,7 +473,7 @@ fn start_session(state: &AppState, req: StreamRequest, owner: u64, client: Strin
             follow_layout(&target, &kwin_output, logical, scale, map, &mut mine);
         });
     }
-    *state.session.lock().unwrap() = Some(Session { app, video, _audio: audio, adaptive: adaptive::Controller::new(bitrate, Instant::now()), adapt_enabled: settings.adaptive_bitrate, cursor_metadata, cursor_epoch:u64::from_le_bytes(token[..8].try_into().unwrap()) });
+    *state.session.lock().unwrap() = Some(Session { app, _placement: placement, video, _audio: audio, adaptive: adaptive::Controller::new(bitrate, Instant::now()), adapt_enabled: settings.adaptive_bitrate, cursor_metadata, cursor_epoch:u64::from_le_bytes(token[..8].try_into().unwrap()) });
     *state.session_owner.lock().unwrap() = owner;
     *state.status.lock().unwrap() = Status {
         streaming: true,

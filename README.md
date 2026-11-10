@@ -163,10 +163,14 @@ Relative mouse motion bypasses all of this and goes to KWin 1:1, unaccelerated.
 
 An app launched for a stream gets `STREETLIGHT_OUTPUT` (the exact KWin connector
 name, `Virtual-…`), `STREETLIGHT_WIDTH` and `STREETLIGHT_HEIGHT` in its environment.
-KWin decides where a window opens, so placing an app such as Steam Big Picture on the
-stream's monitor is done with a **KWin window rule** on that output (recipe in
-[Apps, games and Steam](#apps-games-and-steam)). The host never edits your Plasma
-rules or moves your windows by itself.
+KWin opens a new window on the active screen, which at the start of a stream is the
+PC's own, so Steam Big Picture appeared on the main monitor. While a stream runs an
+app, the host loads a small **KWin script** (through KWin's scripting D-Bus API) that
+sends every new normal window to the stream's output, keeps it full screen if it was,
+and brings it back if a game goes full screen on another monitor
+([`placement.rs`](crates/host/src/placement.rs)). Only windows that open during the
+stream are moved; the script is unloaded when the stream ends. Desktop streams load
+nothing, and the host never edits your Plasma window rules.
 
 ### The cursor
 
@@ -436,20 +440,13 @@ group: with `stop_on_disconnect: true` it's sent TERM when the stream ends, then
 after 500 ms; with `false` (the default) it's left running. Details:
 [docs/APPS.md](docs/APPS.md).
 
-**Steam Big Picture on the stream's monitor:**
-
-1. Pair the client and start **Desktop**, so the virtual monitor exists (its name is in
-   `/api/status` as `output_name`; the KWin connector is `Virtual-` followed by it).
-2. Open Steam Big Picture. In **System Settings → Window Management → Window Rules**,
-   add a rule, use **Detect Window Properties** on the Big Picture window, and narrow it
-   to that window rather than all Steam windows.
-3. Add the **Screen** property and choose the Streetlight monitor; **Apply Initially**
-   to allow moving it later, or **Force**. Add **Fullscreen** if needed.
-4. Pick **Steam Big Picture** from the client's app list (`steam steam://open/bigpicture`,
-   `stop_on_disconnect: false` for a shared Steam instance).
-
-The monitor's name is stable per device, so the rule keeps working, unless the client's
-certificate is reset.
+**Steam Big Picture:** pick it from the client's app list (`steam
+steam://open/bigpicture`, `stop_on_disconnect: false` for a shared Steam instance). The
+host's placement script puts the Big Picture window, and the games launched from it,
+on the stream's monitor. A Big Picture window that was already open before the stream
+stays where it is; close it first. If you'd rather pin placement yourself, a KWin
+window rule on the stream's output still works (the output's name, in `/api/status` as
+`output_name`, is stable per device).
 
 ## Testing
 

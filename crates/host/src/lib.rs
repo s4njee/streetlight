@@ -9,6 +9,7 @@ pub mod encode;
 mod gpu;
 mod input;
 pub mod media;
+mod placement;
 pub mod server;
 pub mod video;
 pub mod web;

@@ -29,22 +29,17 @@ changes retain the host API's confirmation/token requirements.
 
 ## Steam Big Picture on the virtual output
 
-1. Pair the normal client, start Desktop, and inspect `/api/status.status.output_name`.
-   Its KWin connector is `Virtual-` followed by that value. The fingerprint-based
-   name remains stable while that client's certificate and display name are kept.
-2. Open Steam Big Picture. In Plasma System Settings → Window Management → Window
-   Rules, add a rule and use **Detect Window Properties** on its window. Narrow the
-   rule to the Big Picture window/application rather than all Steam game windows.
-3. Add the **Screen** property and select the temporary Streetlight monitor. Use
-   **Apply Initially** if you want to allow later manual movement; use **Force** if
-   the application overrides the initial placement. Add Fullscreen if needed.
-   KDE documents the [rule editor](https://docs.kde.org/stable_kf6/en/kwin/kcontrol/windowspecific/kwin-rule-editor.html)
-   and [initial-placement examples](https://docs.kde.org/stable_kf6/en/kwin/kcontrol/windowspecific/examples.html).
-4. Select the host's Steam Big Picture entry from the client app menu. Its existing
-   command is `steam steam://open/bigpicture`. Keep `stop_on_disconnect: false` for
-   a shared Steam instance. Verify placement once on your Plasma/Steam versions;
-   the recipe has not launched or changed the user's Steam configuration.
+KWin opens new windows on the active screen, which at the start of a stream is the
+PC's own. While a stream runs an app with a command, the host loads a KWin script
+(`crates/host/src/placement.rs`, through `org.kde.kwin.Scripting` on the session bus)
+that sends each new normal window to the stream's output, keeps full screen, and
+returns a window that goes full screen on another monitor. It is unloaded when the
+stream ends; Desktop streams load nothing. So selecting **Steam Big Picture**
+(`steam steam://open/bigpicture`, `stop_on_disconnect: false` for a shared Steam
+instance) brings Big Picture, and the games it starts, onto the stream's monitor.
 
-Rules are configured by the host user; Streetlight does not silently edit Plasma's
-rules or move existing windows. If the monitor list changes or the client certificate
-is reset, revisit the rule's Screen selection.
+A Big Picture window already open before the stream isn't moved: close it first. A KWin
+window rule on the stream's output (System Settings → Window Management → Window
+Rules, property **Screen**) still works if you prefer fixed placement; the output's
+name (`/api/status.status.output_name`, connector `Virtual-` + name) is stable per
+client certificate and display name. The host never edits Plasma's window rules.
