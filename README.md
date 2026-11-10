@@ -224,9 +224,13 @@ latency rather than compression:
 | `async_depth = 1` | one frame in flight in the encoder, not a queue of them |
 | CBR/VBR rate control, AUDs off | steady packet sizes and no wasted bytes |
 
-**Adaptive bitrate** watches the client's feedback (loss, recovered frames, RTT
-growth): 15 % down after sustained trouble, 5 % back up when clean, within the
-client's ceiling. Changing bitrate **reopens only the codec context**; capture, the
+**Adaptive bitrate** watches the client's feedback and treats its two signals
+differently. **Loss** (lost frames, IDR requests, more than 2 % of frames rebuilt by
+FEC) for two seconds cuts 15 %, down to a fifth of the client's request. **Queueing
+delay** (RTT at least double the last 10–20 s's lowest *and* 15 ms above it) for three
+seconds cuts only 10 %, never below half the request, because Wi-Fi RTT wanders
+between 5 and 15 ms with no congestion at all. Three clean seconds raise it 10 % at a
+time, up to the request. Changing bitrate **reopens only the codec context**; capture, the
 VPP pipeline and the cached imports stay up, so an adjustment costs one fresh
 reference chain, not a pipeline restart. **Auto codec** picks AV1 → HEVC → H.264 from
 what the host's VA driver and the client's decoder both support (the Pi says HEVC).
